@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - override /hydra/launcher: submitit_slurm
+
+precompute_embeddings: false
+
+hydra:
+  launcher:
+    # --- set these for your cluster -------------------------------------
+    partition: null        # e.g. "gpu"; null uses the cluster default partition
+    # account: null        # uncomment and set if your site requires -A
+    # qos: null            # uncomment and set if your site requires --qos
+    gres: "gpu:8"          # some sites need a type, e.g. "gpu:a100:8"
+    # --------------------------------------------------------------------
+    nodes: 1
+    tasks_per_node: 8   
+    cpus_per_task: 24     
+    mem_gb: 1600
+    timeout_min: 5760    
+    submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+    max_num_timeout: 9   
+    setup:
+      - unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+      - export DEBUGVAR="$(scontrol show hostnames $SLURM_JOB_NODELIST)"
+      - export MASTER_ADDR="$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)"
+      - export MASTER_PORT="$(for port in $(shuf -i 30000-65500 -n 20); do if ! netstat -tupln 2>&1 | grep -q $port; then echo $port; break; fi; done;)"

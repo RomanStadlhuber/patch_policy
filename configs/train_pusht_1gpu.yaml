@@ -1,0 +1,12 @@
+# Push-T VQ-BeT, single-GPU embedding-precompute run.
+defaults:
+  - train_pusht
+  - override /encoder: dino_patch
+  - override /cluster: local
+  - _self_
+
+batch_size: 8
+epochs: 400 
+eval_on_env_freq: 1
+precompute_embeddings: true
+num_workers: 0

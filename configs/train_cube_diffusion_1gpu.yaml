@@ -1,0 +1,13 @@
+# Cube diffusion policy, single-GPU embedding-precompute run.
+defaults:
+  - train_cube_diffusion
+  - override /encoder: dino_patch
+  - override /cluster: local
+  - _self_
+
+batch_size: 32
+epochs: 300 
+eval_freq: 10
+eval_on_env_freq: 10
+precompute_embeddings: true
+num_workers: 0

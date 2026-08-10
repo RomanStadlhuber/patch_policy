@@ -1,0 +1,16 @@
+# Cube VQ-BeT, single-GPU embedding-precompute run.
+defaults:
+  - train_cube
+  - override /encoder: dino_patch
+  - override /cluster: local
+  - _self_
+
+batch_size: 64
+epochs: 200 
+eval_freq: 5
+eval_on_env_freq: 5
+precompute_embeddings: true
+num_workers: 0
+window_size: 2
+goal_window_size: 2
+eval_window_size: 2

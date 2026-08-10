@@ -1,0 +1,5 @@
+_target_: models.encoder.webssl.WebSSLEncoder
+name: "webSSL"
+feature_key: "x_norm_patchtokens"
+output_dim: 1024
+n_patches: 256

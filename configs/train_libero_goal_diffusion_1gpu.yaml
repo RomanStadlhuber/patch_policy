@@ -1,0 +1,16 @@
+# LIBERO Goal diffusion policy, single-GPU embedding-precompute run.
+defaults:
+  - train_libero_goal_diffusion
+  - override /encoder: dino_patch
+  - override /cluster: local
+  - _self_
+
+batch_size: 256
+epochs: 200 
+eval_freq: 10
+eval_on_env_freq: 10
+precompute_embeddings: true
+num_workers: 0
+window_size: 2
+goal_window_size: 2
+eval_window_size: 2

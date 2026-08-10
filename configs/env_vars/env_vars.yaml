@@ -1,0 +1,11 @@
+save_path: .  # e.g. the absolute path to this repository
+wandb_entity: null  # e.g. your W&B username; null uses your account default
+
+
+dataset_root: ???  # absolute path to the unzipped patch_policy_datasets directory
+
+datasets:
+    pusht: ${env_vars.dataset_root}/pusht_dataset
+    libero: ${env_vars.dataset_root}/libero_dataset
+    block_push: ${env_vars.dataset_root}/block_push_dataset
+    cube: ${env_vars.dataset_root}/cube_dataset

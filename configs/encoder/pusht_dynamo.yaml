@@ -1,0 +1,4 @@
+_target_: models.encoder.from_ckpt.from_ckpt
+f: ???  # path to pusht_pretrained_model.pt
+output_dim: 512
+n_patches: 1
