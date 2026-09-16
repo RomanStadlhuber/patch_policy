@@ -35,6 +35,11 @@ n_action_steps: ${action_window_size} # Action steps to roll out
 
 precompute_embeddings: False
 
+# denoising steps when sampling actions; training always uses 100 (DDPM).
+# Below 100, sampling switches to DDIM on the same trained network.
+rollout_inference_steps: 100  # rollouts during training
+final_inference_steps: 100  # final eval after training
+
 goal_dim: 0
 wandb:
   project: patch_policy

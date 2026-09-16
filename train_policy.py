@@ -482,6 +482,12 @@ def main(cfg):
     # peak of the setup phase (embedding precompute), resets the counters
     metrics_logger.log_peak_vram(step=start_epoch * steps_per_epoch)
 
+    def set_inference_steps(num_inference_steps):
+        # denoising steps for rollouts; set on the model object in use, so it
+        # also applies to checkpoints loaded through load_path
+        if use_diffusion:
+            accelerator.unwrap_model(cbet_model).set_inference_steps(num_inference_steps)
+
     def rollout_scalars(metrics):
         return {"rollout/{}".format(k.replace(" ", "_")): v for k, v in metrics.items()}
 
@@ -490,6 +496,7 @@ def main(cfg):
         accelerator.wait_for_everyone()
         cbet_model.eval()
         if (epoch + 1) % cfg.eval_on_env_freq == 0:
+            set_inference_steps(cfg.get("rollout_inference_steps", 100))
             avg_reward, completion_id_list, max_coverage, final_coverage = eval_on_env(
                 cfg,
                 videorecorder=video,
@@ -652,6 +659,7 @@ def main(cfg):
                           wandb_run_id, metrics_history, reward_history,
                           best_eval_metric)
 
+    set_inference_steps(cfg.get("final_inference_steps", 100))
     avg_reward, completion_id_list, max_coverage, final_coverage = eval_on_env(
         cfg,
         num_evals=cfg.num_final_evals,

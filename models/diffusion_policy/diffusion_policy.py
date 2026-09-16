@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn as nn
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from .diffusion_ema import EMAModel
 from diffusers.optimization import get_scheduler
 from tqdm.auto import tqdm
@@ -761,7 +762,25 @@ class DiffusionPolicy(nn.Module):
             power=0.75,
             update_after_step=0,
         )
+        self.set_inference_steps(self.num_diffusion_iters)
 
+    def set_inference_steps(self, num_inference_steps):
+        """Set the denoising steps used to sample actions. Training is unchanged.
+
+        With all training timesteps, sampling uses the DDPM scheduler as trained.
+        With fewer, it uses DDIM, which skips timesteps of the same trained network.
+        """
+        num_inference_steps = int(num_inference_steps)
+        if not 1 <= num_inference_steps <= self.num_diffusion_iters:
+            raise ValueError(
+                f"num_inference_steps must be in [1, {self.num_diffusion_iters}], "
+                f"got {num_inference_steps}"
+            )
+        if num_inference_steps == self.num_diffusion_iters:
+            self.inference_scheduler = self.noise_scheduler
+        else:
+            self.inference_scheduler = DDIMScheduler.from_config(self.noise_scheduler.config)
+        self.num_inference_steps = num_inference_steps
 
     def forward(
         self,
@@ -876,10 +895,11 @@ class DiffusionPolicy(nn.Module):
         noisy_action = torch.randn((B, self.pred_horizon, self.action_dim), device=device, dtype=next(self.noise_pred_net.parameters()).dtype)
         naction = noisy_action
 
-        self.noise_scheduler.set_timesteps(self.num_diffusion_iters)
-        for k in self.noise_scheduler.timesteps:
+        scheduler = self.inference_scheduler
+        scheduler.set_timesteps(self.num_inference_steps)
+        for k in scheduler.timesteps:
             noise_pred = self.ema_noise_pred_net(sample=naction, timestep=k, cond=obs_cond)
-            naction = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
+            naction = scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
 
         naction = naction.detach()
         action_pred = self.unnormalize_data(naction)

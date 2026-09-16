@@ -37,6 +37,8 @@ class MetricsLogger:
             "betas": list(cfg.optim.betas),
             "batch_size": cfg.batch_size,
             "epochs": cfg.epochs,
+            "rollout_inference_steps": cfg.get("rollout_inference_steps", 100),
+            "final_inference_steps": cfg.get("final_inference_steps", 100),
         }
         table = "| name | value |\n| --- | --- |\n" + "".join(
             f"| {k} | {v} |\n" for k, v in hparams.items()
