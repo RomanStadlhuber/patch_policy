@@ -252,7 +252,9 @@ class TrajectoryEmbeddingDataset(TrajectoryDataset):
         return [x[idx, frames] for x in self.data]
 
     def __getitem__(self, idx):
-        return self.get_frames(idx, range(self.get_seq_length(idx)))
+        # slice, not get_frames(range(...)): a range index copies the whole episode
+        T = self.get_seq_length(idx)
+        return [x[idx, :T] for x in self.data]
 
     def __len__(self):
         return len(self.seq_lengths)
