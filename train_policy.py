@@ -1,6 +1,7 @@
 import einops
 import os
 import random
+import time
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -281,6 +282,7 @@ def main(cfg):
     use_libero_goal = cfg.data.get("use_libero_goal", False)
 
     precompute_embeddings = cfg.get("precompute_embeddings", True)
+    precompute_start = time.perf_counter()
     if precompute_embeddings:
         train_data = TrajectoryEmbeddingDataset(
             encoder, train_data, device='cpu', embed_goal=use_libero_goal
@@ -288,6 +290,8 @@ def main(cfg):
         test_data = TrajectoryEmbeddingDataset(
             encoder, test_data, device='cpu', embed_goal=use_libero_goal
         )
+    precompute_s = time.perf_counter() - precompute_start
+    print(f"Embedding precompute took {precompute_s:.1f} s")
     traj_slicer_kwargs = {
         "window": cfg.data.window_size,
         "action_window": cfg.data.action_window_size,
@@ -479,6 +483,7 @@ def main(cfg):
     )
     if start_epoch == 0:
         metrics_logger.log_config(cfg)
+        metrics_logger.log_scalars({"time/precompute_s": precompute_s}, step=0)
     # peak of the setup phase (embedding precompute), resets the counters
     metrics_logger.log_peak_vram(step=start_epoch * steps_per_epoch)
 
@@ -491,16 +496,24 @@ def main(cfg):
     def rollout_scalars(metrics):
         return {"rollout/{}".format(k.replace(" ", "_")): v for k, v in metrics.items()}
 
+    # per-step data/GPU timers sync the GPU twice per step, which slows training
+    log_step_times = cfg.get("log_step_times", False)
+
     for epoch in tqdm.trange(start_epoch, cfg.epochs):
         epoch_start_step = epoch * steps_per_epoch
         accelerator.wait_for_everyone()
         cbet_model.eval()
         if (epoch + 1) % cfg.eval_on_env_freq == 0:
             set_inference_steps(cfg.get("rollout_inference_steps", 100))
+            rollout_start = time.perf_counter()
             avg_reward, completion_id_list, max_coverage, final_coverage = eval_on_env(
                 cfg,
                 videorecorder=video,
                 epoch=epoch,
+            )
+            metrics_logger.log_scalars(
+                {"time/rollout_s": time.perf_counter() - rollout_start},
+                step=epoch_start_step, epoch=epoch,
             )
             reward_history.append(avg_reward)
             with open("{}/completion_idx_{}.json".format(save_path, epoch), "wb") as fp:
@@ -558,6 +571,7 @@ def main(cfg):
             logger.info(f"Process {accelerator.local_process_index} synchronized after eval_on_env")
 
         if epoch % cfg.eval_freq == 0:
+            eval_start = time.perf_counter()
             total_loss = 0
             action_diff = 0
             action_diff_tot = 0
@@ -598,15 +612,26 @@ def main(cfg):
                     "eval/epoch_wise_action_diff_mean_res2": action_diff_mean_res2,
                     "eval/epoch_wise_action_diff_max": action_diff_max,
                 })
+            eval_scalars["time/eval_s"] = time.perf_counter() - eval_start
             metrics_logger.log_scalars(eval_scalars, step=epoch_start_step, epoch=epoch)
 
         accelerator.wait_for_everyone()
         cbet_model.train()
         train_loss = 0
         train_sums = defaultdict(float)
+        step_times = {}
+        time_sums = defaultdict(float)
+        train_start = time.perf_counter()
+        if log_step_times:
+            data_start = time.perf_counter()
         for i, data in enumerate(tqdm.tqdm(train_loader)):
             optimizer.zero_grad()
             obs, act, goal = (x.to(cfg.device, non_blocking=True) for x in data)
+            if log_step_times:
+                torch.cuda.synchronize()
+                step_start = time.perf_counter()
+                # data_s: loader (slice, collate, pin) plus the copy to the GPU
+                step_times = {"time/data_s": step_start - data_start}
             if not precompute_embeddings:
                 obs = encoder(obs)  # N T V P E
                 if use_libero_goal:
@@ -624,14 +649,22 @@ def main(cfg):
                     cbet_model_raw.ema_step()
                 else:
                     cbet_model.ema_step()
+            if log_step_times:
+                torch.cuda.synchronize()
+                # step_s: forward, backward, optimizer and EMA on the GPU
+                step_times["time/step_s"] = time.perf_counter() - step_start
 
             for x, y in loss_dict.items():
                 train_sums[x] += y
+            for x, y in step_times.items():
+                time_sums[x] += y
             metrics_logger.log_scalars(
-                {"train/{}".format(x): y for x, y in loss_dict.items()},
+                {**{"train/{}".format(x): y for x, y in loss_dict.items()}, **step_times},
                 step=epoch_start_step + i + 1,
                 epoch=epoch,
             )
+            if log_step_times:
+                data_start = time.perf_counter()
 
         if hasattr(cbet_model, "module"):
             if hasattr(accelerator.unwrap_model(cbet_model), "finish_epoch"):
@@ -646,6 +679,11 @@ def main(cfg):
             step=epoch_end_step,
             epoch=epoch,
         )
+        epoch_times = {"time/train_epoch_s": time.perf_counter() - train_start}
+        if log_step_times:
+            epoch_times["time/epoch_data_s"] = time_sums["time/data_s"]
+            epoch_times["time/epoch_step_s"] = time_sums["time/step_s"]
+        metrics_logger.log_scalars(epoch_times, step=epoch_end_step, epoch=epoch)
         # covers this epoch's rollouts, test-set eval and training steps
         metrics_logger.log_peak_vram(step=epoch_end_step, epoch=epoch)
 
@@ -655,16 +693,26 @@ def main(cfg):
         # job can be requeued and continue from the next epoch.
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            snapshot_start = time.perf_counter()
             save_snapshot(save_path, cbet_model, optimizer, accelerator, epoch,
                           wandb_run_id, metrics_history, reward_history,
                           best_eval_metric)
+            metrics_logger.log_scalars(
+                {"time/snapshot_s": time.perf_counter() - snapshot_start},
+                step=epoch_end_step, epoch=epoch,
+            )
 
     set_inference_steps(cfg.get("final_inference_steps", 100))
+    final_eval_start = time.perf_counter()
     avg_reward, completion_id_list, max_coverage, final_coverage = eval_on_env(
         cfg,
         num_evals=cfg.num_final_evals,
         videorecorder=video,
         epoch=cfg.epochs,
+    )
+    metrics_logger.log_scalars(
+        {"time/final_eval_s": time.perf_counter() - final_eval_start},
+        step=cfg.epochs * steps_per_epoch, epoch=cfg.epochs,
     )
 
     # Synchronize all processes after final eval_on_env

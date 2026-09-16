@@ -39,6 +39,9 @@ precompute_embeddings: False
 # Below 100, sampling switches to DDIM on the same trained network.
 rollout_inference_steps: 100  # rollouts during training
 final_inference_steps: 100  # final eval after training
+# log per-step loader and GPU times (time/data_s, time/step_s) to TensorBoard.
+# Useful to debug training performance. Syncs the GPU twice per step, which slows training.
+log_step_times: false
 
 goal_dim: 0
 wandb:
