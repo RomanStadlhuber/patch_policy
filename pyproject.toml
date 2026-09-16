@@ -17,6 +17,7 @@ dependencies = [
     "hydra-submitit-launcher==1.2.0",
     "omegaconf==2.3.0",
     "wandb==0.26.1",
+    "tensorboard==2.21.0",
     "einops==0.8.2",
     "numpy==1.26.4",
     "scipy==1.13.1",
@@ -95,7 +96,6 @@ constraint-dependencies = [
     "dm_control==1.0.27",
     "dm-env==1.6",
     "easydict==1.9",
-    "future==0.18.2",  # bddl imports it without declaring it
     "einops==0.8.2",
     "eval_type_backport==0.3.1",
     "exceptiongroup==1.2.1",
@@ -125,7 +125,6 @@ constraint-dependencies = [
     "idna==3.7",
     "imageio==2.34.1",
     "imageio-ffmpeg==0.4.9",
-    "setuptools==70.0.0",  # imageio-ffmpeg 0.4.9 imports pkg_resources
     "importlib_metadata==7.1.0",
     "importlib_resources==6.4.0",
     "iniconfig==2.0.0",

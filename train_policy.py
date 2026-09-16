@@ -1,7 +1,7 @@
 import einops
 import os
 import random
-from collections import deque
+from collections import defaultdict, deque
 from pathlib import Path
 
 import hydra
@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 
 import wandb
 from utils.video import VideoRecorder
+from utils.metrics_logger import MetricsLogger
 import pickle
 from datasets.core import (
     TrajectoryEmbeddingDataset,
@@ -468,7 +469,24 @@ def main(cfg):
         resume_best_eval_metric if resume_best_eval_metric is not None else float("-inf")
     )
 
+    # x-axis of every logged series: optimizer steps done so far. One step per
+    # batch, so a resumed run at start_epoch continues on the same step values.
+    steps_per_epoch = len(train_loader)
+    metrics_logger = MetricsLogger(
+        save_path / "tensorboard",
+        accelerator.is_main_process,
+        purge_step=start_epoch * steps_per_epoch if start_epoch > 0 else None,
+    )
+    if start_epoch == 0:
+        metrics_logger.log_config(cfg)
+    # peak of the setup phase (embedding precompute), resets the counters
+    metrics_logger.log_peak_vram(step=start_epoch * steps_per_epoch)
+
+    def rollout_scalars(metrics):
+        return {"rollout/{}".format(k.replace(" ", "_")): v for k, v in metrics.items()}
+
     for epoch in tqdm.trange(start_epoch, cfg.epochs):
+        epoch_start_step = epoch * steps_per_epoch
         accelerator.wait_for_everyone()
         cbet_model.eval()
         if (epoch + 1) % cfg.eval_on_env_freq == 0:
@@ -480,8 +498,9 @@ def main(cfg):
             reward_history.append(avg_reward)
             with open("{}/completion_idx_{}.json".format(save_path, epoch), "wb") as fp:
                 pickle.dump(completion_id_list, fp)
-            if accelerator.is_main_process:
-                wandb.log({"eval_on_env": avg_reward, "epoch": epoch})
+            metrics_logger.log_scalars(
+                {"rollout/avg_reward": avg_reward}, step=epoch_start_step, epoch=epoch
+            )
             metrics = None
             if cfg.env.gym.id in ["pusht", "blockpush", "cube"]:
                 metric_final = (
@@ -497,8 +516,9 @@ def main(cfg):
                     f"{metric_max} min": min(max_coverage),
                 }
                 print("final coverage mean: ", sum(final_coverage) / len(final_coverage))
-                if accelerator.is_main_process:
-                    wandb.log({**metrics, "epoch": epoch})
+                metrics_logger.log_scalars(
+                    rollout_scalars(metrics), step=epoch_start_step, epoch=epoch
+                )
                 metrics_history.append(metrics)
 
             # Save the ckpt only when this eval beats all previous evals on the
@@ -537,6 +557,7 @@ def main(cfg):
             action_diff_mean_res1 = 0
             action_diff_mean_res2 = 0
             action_diff_max = 0
+            eval_sums = defaultdict(float)
             with torch.no_grad():
                 for data in test_loader:
                     obs, act, goal = (x.to(cfg.device, non_blocking=True) for x in data)
@@ -550,8 +571,8 @@ def main(cfg):
                     goal = einops.rearrange(goal, "N T V P E -> N T (V P) E")
                     predicted_act, loss, loss_dict = cbet_model(obs, goal, act)
                     total_loss += loss.item()
-                    if accelerator.is_main_process:
-                        wandb.log({**{"eval/{}".format(x): y for (x, y) in loss_dict.items()}, "epoch": epoch})
+                    for x, y in loss_dict.items():
+                        eval_sums[x] += y
                     if not use_diffusion:
                         action_diff += loss_dict["action_diff"]
                         action_diff_tot += loss_dict["action_diff_tot"]
@@ -559,17 +580,24 @@ def main(cfg):
                         action_diff_mean_res2 += loss_dict["action_diff_mean_res2"]
                         action_diff_max += loss_dict["action_diff_max"]
             print(f"Test loss: {total_loss / len(test_loader)}")
-            if accelerator.is_main_process and not use_diffusion:
-                wandb.log({"eval/epoch_wise_action_diff": action_diff, "epoch": epoch})
-                wandb.log({"eval/epoch_wise_action_diff_tot": action_diff_tot, "epoch": epoch})
-                wandb.log({"eval/epoch_wise_action_diff_mean_res1": action_diff_mean_res1, "epoch": epoch})
-                wandb.log({"eval/epoch_wise_action_diff_mean_res2": action_diff_mean_res2, "epoch": epoch})
-                wandb.log({"eval/epoch_wise_action_diff_max": action_diff_max, "epoch": epoch})
+            eval_scalars = {
+                "eval/{}".format(x): y / len(test_loader) for x, y in eval_sums.items()
+            }
+            if not use_diffusion:
+                eval_scalars.update({
+                    "eval/epoch_wise_action_diff": action_diff,
+                    "eval/epoch_wise_action_diff_tot": action_diff_tot,
+                    "eval/epoch_wise_action_diff_mean_res1": action_diff_mean_res1,
+                    "eval/epoch_wise_action_diff_mean_res2": action_diff_mean_res2,
+                    "eval/epoch_wise_action_diff_max": action_diff_max,
+                })
+            metrics_logger.log_scalars(eval_scalars, step=epoch_start_step, epoch=epoch)
 
         accelerator.wait_for_everyone()
         cbet_model.train()
         train_loss = 0
-        for data in tqdm.tqdm(train_loader):
+        train_sums = defaultdict(float)
+        for i, data in enumerate(tqdm.tqdm(train_loader)):
             optimizer.zero_grad()
             obs, act, goal = (x.to(cfg.device, non_blocking=True) for x in data)
             if not precompute_embeddings:
@@ -590,8 +618,13 @@ def main(cfg):
                 else:
                     cbet_model.ema_step()
 
-            if accelerator.is_main_process:
-                wandb.log({**{"train/{}".format(x): y for (x, y) in loss_dict.items()}, "epoch": epoch})
+            for x, y in loss_dict.items():
+                train_sums[x] += y
+            metrics_logger.log_scalars(
+                {"train/{}".format(x): y for x, y in loss_dict.items()},
+                step=epoch_start_step + i + 1,
+                epoch=epoch,
+            )
 
         if hasattr(cbet_model, "module"):
             if hasattr(accelerator.unwrap_model(cbet_model), "finish_epoch"):
@@ -600,6 +633,14 @@ def main(cfg):
             if hasattr(cbet_model, "finish_epoch"):
                 cbet_model.finish_epoch()
         print(f"Train loss: {train_loss / len(train_loader)}")
+        epoch_end_step = (epoch + 1) * steps_per_epoch
+        metrics_logger.log_scalars(
+            {"train/epoch_{}".format(x): y / len(train_loader) for x, y in train_sums.items()},
+            step=epoch_end_step,
+            epoch=epoch,
+        )
+        # covers this epoch's rollouts, test-set eval and training steps
+        metrics_logger.log_peak_vram(step=epoch_end_step, epoch=epoch)
 
         # Save a resume snapshot every epoch (preemptable support). This is
         # independent of the best-eval-gated model_{epoch}.pt above: the
@@ -629,6 +670,9 @@ def main(cfg):
     print(f"Final eval, always saving ckpt to {save_path}/model_final.pt")
     save_model("final", force=True)
     reward_history.append(avg_reward)
+    metrics_logger.log_scalars(
+        {"rollout/avg_reward": avg_reward}, step=cfg.epochs * steps_per_epoch, epoch=cfg.epochs
+    )
     if cfg.env.gym.id in ["pusht", "blockpush", "cube"]:
         metric_final = "final coverage" if cfg.env.gym.id == "pusht" else "entered"
         metric_max = "max coverage" if cfg.env.gym.id == "pusht" else "moved"
@@ -640,8 +684,9 @@ def main(cfg):
             f"{metric_max} max": max(max_coverage),
             f"{metric_max} min": min(max_coverage),
         }
-        if accelerator.is_main_process:
-            wandb.log({**metrics, "epoch": cfg.epochs})
+        metrics_logger.log_scalars(
+            rollout_scalars(metrics), step=cfg.epochs * steps_per_epoch, epoch=cfg.epochs
+        )
         metrics_history.append(metrics)
 
     with open("{}/completion_idx_final.json".format(save_path), "wb") as fp:
@@ -652,8 +697,12 @@ def main(cfg):
         final_eval_on_env = max([x["entered mean"] for x in metrics_history])
     else:  # libero_goal and anything else without a coverage-style metric
         final_eval_on_env = max(reward_history)
-    if accelerator.is_main_process:
-        wandb.log({"final_eval_on_env": final_eval_on_env, "epoch": cfg.epochs})
+    metrics_logger.log_scalars(
+        {"rollout/best_final_eval": final_eval_on_env},
+        step=cfg.epochs * steps_per_epoch,
+        epoch=cfg.epochs,
+    )
+    metrics_logger.close()
     return final_eval_on_env
 
 
