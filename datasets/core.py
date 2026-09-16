@@ -5,7 +5,6 @@ import numpy as np
 from torch import default_generator, randperm
 from torch.utils.data import Dataset, Subset
 from typing import Callable, Optional, Sequence, List
-from torch.nn.utils.rnn import pad_sequence
 
 
 # Taken from python 3.5 docs
@@ -232,29 +231,22 @@ class TrajectoryEmbeddingDataset(TrajectoryDataset):
             embed_goal=embed_goal,
         )
         assert len(self.data) == len(dataset)
-
+        # one (obs, act, *others) tuple per episode, kept unpadded: padding to the
+        # longest episode doubles the RAM and every read takes a whole episode anyway
         self.seq_lengths = [len(x[0]) for x in self.data]
-        self.on_device_data = []
-        n_tensors = len(self.data[0])
-        for i in range(n_tensors):
-            self.on_device_data.append(
-                pad_sequence([x[i] for x in self.data], batch_first=True).to(device)
-            )
-        self.data = self.on_device_data
 
     def get_seq_length(self, idx):
         return self.seq_lengths[idx]
 
     def get_all_actions(self):
-        return torch.cat([x[1] for x in self.data], dim=0)
+        return torch.cat([episode[1] for episode in self.data], dim=0)
 
     def get_frames(self, idx, frames):
-        return [x[idx, frames] for x in self.data]
+        return [x[frames] for x in self.data[idx]]
 
     def __getitem__(self, idx):
-        # slice, not get_frames(range(...)): a range index copies the whole episode
-        T = self.get_seq_length(idx)
-        return [x[idx, :T] for x in self.data]
+        # the stored tensors, not get_frames(range(...)): a range index copies the episode
+        return list(self.data[idx])
 
     def __len__(self):
         return len(self.seq_lengths)
