@@ -369,6 +369,10 @@ def main(cfg):
             if videorecorder is not None:
                 videorecorder.init(enabled=True)
             obs_stack = deque(maxlen=cfg.eval_window_size)
+            if cfg.env.gym.id == "pusht":
+                # PushTEnv.reset rebuilds its RNG from the seed, so each batch needs its own seeds
+                base_seed = cfg.seed + goal_idx * cfg.num_envs
+                env.seed([base_seed + j for j in range(cfg.num_envs)])
             this_obs = env.reset(goal_idx=goal_idx)  # N V C H W
             print(f"Eval on goal {goal_idx}/{num_batches}, {cfg.num_envs} episodes")
             assert (
@@ -428,8 +432,6 @@ def main(cfg):
                 goal = goal_fn(goal_idx)
             avg_reward += total_reward
             if cfg.env.gym.id == "pusht":
-                base_seed = cfg.seed + goal_idx * cfg.num_envs
-                env.seed([base_seed + j for j in range(cfg.num_envs)])
                 avg_max_coverage += [info[i]["max_coverage"] for i in range(len(info))]
                 avg_final_coverage += [info[i]["final_coverage"] for i in range(len(info))]
             elif cfg.env.gym.id in ["blockpush", "cube"]:
