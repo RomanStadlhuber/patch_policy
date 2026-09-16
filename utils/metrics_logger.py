@@ -39,6 +39,7 @@ class MetricsLogger:
             "epochs": cfg.epochs,
             "rollout_inference_steps": cfg.get("rollout_inference_steps", 100),
             "final_inference_steps": cfg.get("final_inference_steps", 100),
+            "ddim_eta": cfg.get("ddim_eta", 0.0),
         }
         table = "| name | value |\n| --- | --- |\n" + "".join(
             f"| {k} | {v} |\n" for k, v in hparams.items()
