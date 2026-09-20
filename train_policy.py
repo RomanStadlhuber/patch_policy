@@ -281,9 +281,12 @@ def main(cfg):
     embedding_dtype = torch.float16 if embedding_fp16 else None
     # "memmap" keeps the cache in a file instead, so host RAM stops being the
     # ceiling on dataset size and the encoder pass is reused across runs
-    use_memmap = precompute_embeddings and cfg.get("embedding_cache", "ram") == "memmap"
+    use_file_cache = precompute_embeddings and cfg.get("embedding_cache", "ram") in (
+        "file",
+        "memmap",  # what the option was called before the streams landed
+    )
     precompute_start = time.perf_counter()
-    if use_memmap:
+    if use_file_cache:
         cache_dir = cfg.get("embedding_cache_dir", None) or (
             Path(cfg.env_vars.dataset_root) / "embedding_cache"
         )
@@ -295,9 +298,16 @@ def main(cfg):
             np_dtype().dtype.name,
             use_libero_goal,
         )
+        # recorded in the manifest so a cache directory says what made it
+        encoder_ref = {
+            "hub_repo": cfg.encoder.get("hub_repo", ""),
+            "name": cfg.encoder.get("name", ""),
+            "feature_key": cfg.encoder.get("feature_key", ""),
+        }
         embedded = FileEmbeddingDataset(
             encoder, dataset, cache_dir, cache_key,
             dtype=np_dtype, embed_goal=use_libero_goal,
+            encoder=encoder_ref, dataset_name=Path(cfg.dataset.data_directory).name,
         )
         # split after embedding: random_split_traj only sees len(dataset), which
         # is unchanged, so a given seed picks the same episodes either way

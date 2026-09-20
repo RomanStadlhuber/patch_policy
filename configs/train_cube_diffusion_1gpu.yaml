@@ -14,4 +14,4 @@ num_workers: 2
 
 # cached embeddings in fp16: halves the host-RAM cache the precompute builds
 embedding_fp16: true
-embedding_cache: memmap
+embedding_cache: file
