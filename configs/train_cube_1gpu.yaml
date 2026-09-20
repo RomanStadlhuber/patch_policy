@@ -10,7 +10,7 @@ epochs: 200
 eval_freq: 5
 eval_on_env_freq: 5
 precompute_embeddings: true
-num_workers: 0
+num_workers: 8
 window_size: 2
 goal_window_size: 2
 eval_window_size: 2

@@ -19,7 +19,6 @@ class CubeDataset(TrajectoryDataset):
         **kwargs,
     ):
         self.data_directory = Path(data_directory)
-        self.states = torch.load(self.data_directory / "latents.pth")
         self.actions = torch.load(self.data_directory / "actions.pth")
         with open(self.data_directory / "seq_lengths.pkl", "rb") as f:
             self.seq_lengths = pickle.load(f)
@@ -27,11 +26,10 @@ class CubeDataset(TrajectoryDataset):
         self.subset_fraction = subset_fraction
         if self.subset_fraction:
             assert self.subset_fraction > 0 and self.subset_fraction <= 1
-            n = int(len(self.states) * self.subset_fraction)
+            n = int(len(self.seq_lengths) * self.subset_fraction)
         else:
-            n = len(self.states)
+            n = len(self.seq_lengths)
 
-        self.states = self.states[:n]
         self.actions = self.actions[:n]
         self.seq_lengths = self.seq_lengths[:n]
 

@@ -77,7 +77,7 @@ class TrajectorySlicerDataset(Dataset):
 
     dataset: a trajectory dataset that satisfies:
         dataset.get_seq_length(i) returns the length of sequence i
-        dataset[i] = (observations, actions, *others)
+        dataset.get_frames(i, frames) = (observations, actions, *others), each sliced to frames
         observations: Tensor[T, ...]
         actions: Tensor[T, ...]
     window: int
@@ -170,28 +170,31 @@ class TrajectorySlicerDataset(Dataset):
 
     def __getitem__(self, idx):
         i, start, end = self.slices[idx]
-        obs, act, *others = self.dataset[i]
+        # fetch only the frames this slice needs (the union of the obs window and
+        # the action window, which can extend past it) instead of the whole
+        # episode: dataset[i] reprocesses every frame of the episode, while
+        # get_frames does work proportional to what's requested
+        T = self.dataset.get_seq_length(i)
+        # -1 due to overlap for 1 step between obs and act
+        frame_end = min(end - 1 + self.action_window, T)
+        obs, act, *others = self.dataset.get_frames(i, range(start, frame_end))
+        rel_end = end - start  # obs/others only use the obs part of the fetched range
         if end - start < self.window:
             obs_win = utils.inference.repeat_start_to_length(
-                obs[start:end], self.window, dim=0
+                obs[:rel_end], self.window, dim=0
             )
             act = utils.inference.repeat_start_to_length(
-                # -1 due to overlap for 1 step between obs and act
-                act[start : end - 1 + self.action_window],
-                self.window + self.action_window - 1,
-                dim=0,
+                act, self.window + self.action_window - 1, dim=0
             )
             repeated_others = [
                 utils.inference.repeat_start_to_length(
-                    other[start:end], self.window, dim=0
+                    other[:rel_end], self.window, dim=0
                 )
                 for other in others
             ]
         else:
-            obs_win = obs[start:end]
-            # -1 due to overlap for 1 step between obs and act
-            act = act[start : end - 1 + self.action_window]
-            repeated_others = [other[start:end] for other in others]
+            obs_win = obs[:rel_end]
+            repeated_others = [other[:rel_end] for other in others]
 
         if self.vqbet_get_future_action_chunk:
             expected_len = self.action_window

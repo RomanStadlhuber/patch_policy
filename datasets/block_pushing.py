@@ -64,26 +64,21 @@ class PushMultiviewTrajectoryDataset(TrajectoryDataset):
                 frames
             ]
         obs = einops.rearrange(obs, "T V H W C -> T V C H W") / 255.0
+        if self.view_idx is not None:
+            obs = obs[:, self.view_idx : self.view_idx + 1]
         act = self.actions[idx, frames]
         mask = self.masks[idx, frames]
         if self.onehot_goals:
             goal = self.goals[idx, frames]
             # return obs, act, mask, goal
-            return obs, act, goal 
+            return obs, act, goal
         else:
             dummy_goal = torch.ones([obs.shape[0], 1, 1, 1]) # dummy goal, T V P E
             return obs, act, dummy_goal
 
     def __getitem__(self, idx):
         T = self.masks[idx].sum().int().item()
-        output = self.get_frames(idx, range(T))
-        if self.view_idx is not None:
-            output = (
-                output[0][:, self.view_idx : self.view_idx + 1],
-                output[1],
-                output[2],
-            )
-        return output
+        return self.get_frames(idx, range(T))
 
     def __len__(self):
         return len(self.states)

@@ -269,11 +269,7 @@ def main(cfg):
 
     ##############################################
 
-    print("Saving to {}".format(os.getcwd()))
-    video = VideoRecorder(dir_name=save_path)
-
-    # init datasets
-    dataset = hydra.utils.instantiate(cfg.dataset)
+    # dataset/video already built above (before get_all_actions()); reuse them here
     train_data, test_data = split_traj_datasets(
         dataset,
         train_fraction=cfg.train_fraction,
@@ -344,6 +340,11 @@ def main(cfg):
         def goal_fn(goal_idx):
             return empty_tensor
 
+    # train_data/test_data hold the embeddings now, and the LIBERO-goal branch
+    # above (if any) already read the raw frames it needs from dataset, so the
+    # prefetched raw episodes can be freed instead of staying resident for the run.
+    if precompute_embeddings and getattr(dataset, "prefetch", False):
+        dataset.obses = None
 
     @torch.no_grad()
     def eval_on_env(
