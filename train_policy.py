@@ -16,8 +16,10 @@ from utils.video import VideoRecorder
 from utils.metrics_logger import MetricsLogger
 import pickle
 from datasets.core import (
+    FileEmbeddingDataset,
     TrajectoryEmbeddingDataset,
     TrajectorySlicerDataset,
+    embedding_cache_key,
     split_traj_datasets,
 )
 from envs.venv import SubprocVectorEnv
@@ -270,22 +272,55 @@ def main(cfg):
     ##############################################
 
     # dataset/video already built above (before get_all_actions()); reuse them here
-    train_data, test_data = split_traj_datasets(
-        dataset,
-        train_fraction=cfg.train_fraction,
-        random_seed=cfg.seed,
-    )
     use_libero_goal = cfg.data.get("use_libero_goal", False)
 
     precompute_embeddings = cfg.get("precompute_embeddings", True)
+    # the cached embeddings live in host RAM, not VRAM, and dominate it: fp16
+    # halves that at no cost to a frozen encoder's conditioning features
+    embedding_fp16 = cfg.get("embedding_fp16", False)
+    embedding_dtype = torch.float16 if embedding_fp16 else None
+    # "memmap" keeps the cache in a file instead, so host RAM stops being the
+    # ceiling on dataset size and the encoder pass is reused across runs
+    use_memmap = precompute_embeddings and cfg.get("embedding_cache", "ram") == "memmap"
     precompute_start = time.perf_counter()
-    if precompute_embeddings:
-        train_data = TrajectoryEmbeddingDataset(
-            encoder, train_data, device='cpu', embed_goal=use_libero_goal
+    if use_memmap:
+        cache_dir = cfg.get("embedding_cache_dir", None) or (
+            Path(cfg.env_vars.dataset_root) / "embedding_cache"
         )
-        test_data = TrajectoryEmbeddingDataset(
-            encoder, test_data, device='cpu', embed_goal=use_libero_goal
+        np_dtype = np.float16 if embedding_fp16 else np.float32
+        cache_key = embedding_cache_key(
+            OmegaConf.to_yaml(cfg.encoder, resolve=True),
+            cfg.dataset.data_directory,
+            cfg.dataset.get("subset_fraction", None),
+            np_dtype().dtype.name,
+            use_libero_goal,
         )
+        embedded = FileEmbeddingDataset(
+            encoder, dataset, cache_dir, cache_key,
+            dtype=np_dtype, embed_goal=use_libero_goal,
+        )
+        # split after embedding: random_split_traj only sees len(dataset), which
+        # is unchanged, so a given seed picks the same episodes either way
+        train_data, test_data = split_traj_datasets(
+            embedded,
+            train_fraction=cfg.train_fraction,
+            random_seed=cfg.seed,
+        )
+    else:
+        train_data, test_data = split_traj_datasets(
+            dataset,
+            train_fraction=cfg.train_fraction,
+            random_seed=cfg.seed,
+        )
+        if precompute_embeddings:
+            train_data = TrajectoryEmbeddingDataset(
+                encoder, train_data, device='cpu', embed_goal=use_libero_goal,
+                dtype=embedding_dtype,
+            )
+            test_data = TrajectoryEmbeddingDataset(
+                encoder, test_data, device='cpu', embed_goal=use_libero_goal,
+                dtype=embedding_dtype,
+            )
     precompute_s = time.perf_counter() - precompute_start
     print(f"Embedding precompute took {precompute_s:.1f} s")
     traj_slicer_kwargs = {
@@ -589,6 +624,7 @@ def main(cfg):
                         obs = encoder(obs)  # N T V P E
                         if use_libero_goal:
                             goal = encoder(goal)  # N T V P E
+                    obs, goal = obs.float(), goal.float()
                     assert obs.ndim == 5, "expect N T V P E for obs"
                     assert goal.ndim == 5, "expect N T V P E for goals"
                     obs = einops.rearrange(obs, "N T V P E -> N T (V P) E") # keep the patch dim
@@ -639,6 +675,8 @@ def main(cfg):
                 obs = encoder(obs)  # N T V P E
                 if use_libero_goal:
                     goal = encoder(goal)  # N T V P E
+            # fp16 cache: upcast on the GPU, so the copy above moves half the bytes
+            obs, goal = obs.float(), goal.float()
             obs = einops.rearrange(obs, "N T V P E -> N T (V P) E")
             goal = einops.rearrange(goal, "N T V P E -> N T (V P) E")
             predicted_act, loss, loss_dict = cbet_model(obs, goal, act)

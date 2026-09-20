@@ -36,6 +36,7 @@ def embed_trajectory_dataset(
     obs_only=True,
     device=None,
     embed_goal=False,
+    dtype=None,
 ):  
     if False:
     # if type(model) is nn.parallel.DistributedDataParallel:
@@ -45,6 +46,7 @@ def embed_trajectory_dataset(
             obs_only=obs_only,
             device=device,
             embed_goal=embed_goal,
+            dtype=dtype,
         )
     else:
         print("########## Embedding dataset on single device")
@@ -59,7 +61,9 @@ def embed_trajectory_dataset(
                 obs, *rest = dataset[i]
                 obs = obs.to(model_device)
                 obs_enc = model(obs)
-                obs_enc = obs_enc.detach().to(result_device)
+                # dtype halves the cached embeddings: the encoder is frozen, so
+                # these are conditioning inputs, never accumulated gradients
+                obs_enc = obs_enc.detach().to(result_device, dtype=dtype)
 
                 if obs_only:
                     result.append(obs_enc)
@@ -70,7 +74,7 @@ def embed_trajectory_dataset(
                         rest = rest[:-1]
                         goal = goal.to(model_device)
                         goal_enc = model(goal)
-                        goal_enc = goal_enc.detach().to(result_device)
+                        goal_enc = goal_enc.detach().to(result_device, dtype=dtype)
                         rest.append(goal_enc)
                     rest = [x.to(result_device) for x in rest]
                     result.append((obs_enc, *rest))
@@ -83,6 +87,7 @@ def embed_trajectory_dataset_ddp(
     obs_only=True,
     device=None,
     embed_goal=False,
+    dtype=None,
 ):
     assert type(model) is nn.parallel.DistributedDataParallel, "Model must be DDP"
     embeddings = []

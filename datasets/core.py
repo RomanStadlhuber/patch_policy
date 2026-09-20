@@ -1,10 +1,14 @@
 import abc
+import hashlib
+import json
+import os
 import utils
 import torch
 import numpy as np
+from pathlib import Path
 from torch import default_generator, randperm
 from torch.utils.data import Dataset, Subset
-from typing import Callable, Optional, Sequence, List
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 
 # Taken from python 3.5 docs
@@ -225,6 +229,7 @@ class TrajectoryEmbeddingDataset(TrajectoryDataset):
         dataset: TrajectoryDataset,
         device="cpu",
         embed_goal=False,
+        dtype=None,
     ):
         self.data = utils.inference.embed_trajectory_dataset(
             model,
@@ -232,6 +237,7 @@ class TrajectoryEmbeddingDataset(TrajectoryDataset):
             obs_only=False,
             device=device,
             embed_goal=embed_goal,
+            dtype=dtype,
         )
         assert len(self.data) == len(dataset)
         # one (obs, act, *others) tuple per episode, kept unpadded: padding to the
@@ -253,6 +259,162 @@ class TrajectoryEmbeddingDataset(TrajectoryDataset):
 
     def __len__(self):
         return len(self.seq_lengths)
+
+
+class FileEmbeddingDataset(TrajectoryDataset):
+    """Precomputed patch embeddings kept in a file instead of in RAM.
+
+    TrajectoryEmbeddingDataset holds every episode's features resident, which
+    is ~30 GiB for Cube at fp32 and does not fit a 31 GB host. This writes them
+    once into a flat file and reads back only the rows a sample needs, so host
+    RAM bounds the batch rather than the dataset, and the file is reused by
+    later runs instead of re-running the encoder.
+
+    Reads go through os.pread rather than a memmap on purpose. Mapping the file
+    grows the process RSS as an epoch touches every row, and that memory is
+    charged to us; explicit reads leave the caching to the page cache, which
+    the kernel can reclaim under pressure.
+
+    The actions and goals stay in RAM. They are a few MB, and the goal is a
+    dummy tensor for every environment except LIBERO.
+    """
+
+    def __init__(
+        self,
+        model: "torch.nn.Module",
+        dataset: TrajectoryDataset,
+        cache_dir: "os.PathLike",
+        cache_key: str,
+        dtype: Any = np.float16,
+        embed_goal: bool = False,
+    ):
+        self.dtype = np.dtype(dtype)
+        cache_dir = Path(cache_dir) / cache_key
+        self.obs_path = cache_dir / "obs.dat"
+        self.meta_path = cache_dir / "meta.pt"
+
+        if not (self.obs_path.exists() and self.meta_path.exists()):
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            self._build(model, dataset, embed_goal)
+            print(f"########## Wrote embedding cache to {cache_dir}")
+        else:
+            print(f"########## Reusing embedding cache at {cache_dir}")
+
+        meta = torch.load(self.meta_path, weights_only=False)
+        self.seq_lengths = meta["seq_lengths"]
+        self.offsets = meta["offsets"]
+        self.rest = meta["rest"]  # per-episode (act, goal, ...) tensors
+        self.frame_shape = tuple(meta["frame_shape"])
+        assert len(self.seq_lengths) == len(dataset)
+
+        # bytes per frame: the row stride in obs.dat
+        self.row_stride = int(np.prod(self.frame_shape)) * self.dtype.itemsize
+        self.num_rows = sum(self.seq_lengths)
+        # opened lazily, and re-opened per process: dataloader workers are
+        # forked, and a descriptor is cheaper to remake than to reason about
+        self._fd: Optional[int] = None
+        self._fd_pid: Optional[int] = None
+
+    def _build(
+        self,
+        model: "torch.nn.Module",
+        dataset: TrajectoryDataset,
+        embed_goal: bool,
+    ) -> None:
+        seq_lengths = [dataset.get_seq_length(i) for i in range(len(dataset))]
+        offsets = list(_accumulate([0] + seq_lengths))[:-1]
+
+        accelerator = utils.inference.Accelerator()
+        model_device = accelerator.device
+        frame_shape: Optional[Tuple[int, ...]] = None
+        rest_all: List[List[torch.Tensor]] = []
+
+        # written straight through: the pass is sequential, so a plain handle
+        # avoids the dirty-page build-up a write-mode memmap accumulates
+        with open(self.obs_path, "wb") as fh:
+            with utils.inference.eval_mode(model, no_grad=True):
+                for i in utils.inference.tqdm(range(len(dataset)), total=len(dataset)):
+                    obs, *rest = dataset[i]
+                    obs_enc = model(obs.to(model_device)).detach()
+                    if frame_shape is None:
+                        # only known after the first forward pass
+                        frame_shape = tuple(obs_enc.shape[1:])
+                    fh.write(
+                        obs_enc.to("cpu", dtype=torch.float32)
+                        .numpy()
+                        .astype(self.dtype)
+                        .tobytes()
+                    )
+                    if embed_goal:
+                        # assuming goal comes last
+                        goal = rest[-1].to(model_device)
+                        rest = rest[:-1] + [model(goal).detach().cpu()]
+                    rest_all.append(
+                        [x.cpu() if torch.is_tensor(x) else x for x in rest]
+                    )
+
+        torch.save(
+            {
+                "seq_lengths": seq_lengths,
+                "offsets": offsets,
+                "rest": rest_all,
+                "frame_shape": frame_shape,
+            },
+            self.meta_path,
+        )
+
+    def _descriptor(self) -> int:
+        pid = os.getpid()
+        if self._fd is None or self._fd_pid != pid:
+            self._fd = os.open(str(self.obs_path), os.O_RDONLY)
+            self._fd_pid = pid
+        return self._fd
+
+    def _read_rows(self, rows: np.ndarray) -> torch.Tensor:
+        """Read whole frames by row index, coalescing consecutive rows."""
+        fd = self._descriptor()
+        chunks: List[np.ndarray] = []
+        start = 0
+        while start < len(rows):
+            # consecutive rows are contiguous on disk, so one read serves them
+            end = start + 1
+            while end < len(rows) and rows[end] == rows[end - 1] + 1:
+                end += 1
+            count = end - start
+            raw = os.pread(
+                fd, count * self.row_stride, int(rows[start]) * self.row_stride
+            )
+            chunks.append(np.frombuffer(raw, dtype=self.dtype))
+            start = end
+        flat = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+        # np.frombuffer is read-only; torch needs a writable buffer to own
+        return torch.from_numpy(flat.reshape(len(rows), *self.frame_shape).copy())
+
+    def get_seq_length(self, idx: int) -> int:
+        return self.seq_lengths[idx]
+
+    def get_all_actions(self) -> torch.Tensor:
+        return torch.cat([rest[0] for rest in self.rest], dim=0)
+
+    def get_frames(self, idx: int, frames: Sequence[int]) -> List[torch.Tensor]:
+        length = self.seq_lengths[idx]
+        local = np.asarray(frames, dtype=np.int64)
+        # negative indices address the episode, not the row before it
+        local = np.where(local < 0, local + length, local)
+        obs = self._read_rows(local + self.offsets[idx])
+        return [obs, *(x[local] for x in self.rest[idx])]
+
+    def __getitem__(self, idx: int) -> List[torch.Tensor]:
+        return self.get_frames(idx, range(self.seq_lengths[idx]))
+
+    def __len__(self) -> int:
+        return len(self.seq_lengths)
+
+
+def embedding_cache_key(*parts: Any) -> str:
+    """Stable directory name for one (encoder, dataset, dtype) combination."""
+    blob = json.dumps([str(p) for p in parts], sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
 def random_split_traj(
