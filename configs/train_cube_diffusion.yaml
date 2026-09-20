@@ -17,7 +17,7 @@ window_size: 2
 goal_window_size: 2
 eval_window_size: 2
 
-num_workers: 0
+num_workers: 8
 
 batch_size: 32
 epochs: 300 
@@ -26,6 +26,11 @@ eval_on_env_freq: 10
 num_env_evals: 100
 num_envs: 10
 num_final_evals: 100
+
+# denoising steps when sampling actions with DDIM; training always uses num_train_timesteps.
+rollout_inference_steps: 100  # rollouts during training
+final_inference_steps: 100  # final eval after training
+ddim_eta: 0.0  # 0.0 samples deterministically, 1.0 adds as much noise per step as DDPM
 action_window_size: 3
 
 pred_horizon: ${eval:'${action_window_size} + ${window_size} - 1'}
@@ -63,6 +68,9 @@ env:
 dataset:
   _target_: datasets.cube.CubeDataset
   data_directory: ${env_vars.datasets.cube}
+  # prefetching all episodes' raw frames into RAM (51 GB) doesn't fit a 31 GB
+  # desktop; read each episode from disk once, at precompute (or per step) instead
+  prefetch: false
 
 data:
   window_size: ${window_size}
@@ -91,3 +99,7 @@ model:
   weight_decay: ${optim.weight_decay}
   use_transform: null
   n_patches: ${encoder.n_patches} # number of patches along one dimension (e.g. 16 for 16x16 patches)
+  num_train_timesteps: 100
+  num_inference_steps: ${rollout_inference_steps}
+  ddim_eta: ${ddim_eta}
+  timestep_spacing: trailing

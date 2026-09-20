@@ -4,6 +4,9 @@ import pickle
 from pathlib import Path
 from typing import Optional
 from datasets.core import TrajectoryDataset
+from typing import Sequence
+
+from datasets.types import Sample
 
 
 class PushTDataset(TrajectoryDataset):
@@ -56,7 +59,7 @@ class PushTDataset(TrajectoryDataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
-    def get_frames(self, idx, frames):
+    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
         if self.prefetch:
             obs = self.obses[idx][frames]
         else:
@@ -65,12 +68,10 @@ class PushTDataset(TrajectoryDataset):
             obs = obs[frames]
         obs = einops.rearrange(obs, "T H W C -> T 1 C H W") / 255.0  # T V C H W, 1 view
         act = self.actions[idx, frames]
-        mask = torch.ones(len(act)).bool()
         dummy_goal = torch.ones([obs.shape[0], 1, 1, 1]) # dummy goal, T V P E
-        # return obs, act, mask, goal
-        return obs, act, dummy_goal
+        return {"obs": obs, "action": act, "goal": dummy_goal}
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Sample:
         return self.get_frames(idx, range(self.get_seq_length(idx)))
 
     def __len__(self):

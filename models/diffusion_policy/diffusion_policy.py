@@ -1,10 +1,11 @@
-from typing import Tuple, Sequence, Dict, Union, Optional
+from typing import Tuple, Sequence, Dict, Union, Optional, Literal
 import numpy as np
 import math
 import torch
 import torch.nn as nn
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from .diffusion_ema import EMAModel
+from utils.normalizer import LinearNormalizer
 from diffusers.optimization import get_scheduler
 from tqdm.auto import tqdm
 import torch.nn as nn
@@ -682,9 +683,9 @@ class DiffusionPolicy(nn.Module):
         obs_horizon: int,
         pred_horizon: int,
         action_horizon: int,
-        views=1,
-        data_act_scale=1.0,
-        visual_input=False,
+        views: int = 1,
+        data_act_scale: float = 1.0,
+        visual_input: bool = False,
         p_drop_emb: float = 0.0,
         p_drop_attn: float = 0.1,
         n_layer: int = 8,
@@ -693,7 +694,11 @@ class DiffusionPolicy(nn.Module):
         lr: float = 1e-4,
         weight_decay: float = 0.0,
         use_transform=None,
-        n_patches=1,
+        n_patches: int = 1,
+        num_train_timesteps: int = 100,
+        num_inference_steps: int = 100,
+        ddim_eta: float = 0.0,
+        timestep_spacing: Literal["leading", "trailing", "linspace"] = "trailing",
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -740,10 +745,9 @@ class DiffusionPolicy(nn.Module):
             n_patches=n_patches * views,
         ).cuda()
         #############################################################
-        # for this demo, we use DDPMScheduler with 100 diffusion iterations
-        self.num_diffusion_iters = 100
-        self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=self.num_diffusion_iters,
+        # DDIM trains like DDPM, but can sample with a subset of the training timesteps
+        self.noise_scheduler = DDIMScheduler(
+            num_train_timesteps=num_train_timesteps,
             # the choise of beta schedule has big impact on performance
             # we found squared cosine works the best
             beta_schedule="squaredcos_cap_v2",
@@ -751,7 +755,11 @@ class DiffusionPolicy(nn.Module):
             clip_sample=True,
             # our network predicts noise (instead of denoised action)
             prediction_type="epsilon",
+            # "trailing" starts sampling at the noisiest timestep at low step counts
+            timestep_spacing=timestep_spacing,
         )
+        # 0.0 samples deterministically, 1.0 adds as much noise per step as DDPM
+        self.ddim_eta = ddim_eta
 
         self.ema = EMAModel(
             self.noise_pred_net,
@@ -761,7 +769,20 @@ class DiffusionPolicy(nn.Module):
             power=0.75,
             update_after_step=0,
         )
+        self.set_inference_steps(num_inference_steps)
 
+    def set_inference_steps(self, num_inference_steps: int) -> None:
+        """Set the denoising steps used to sample actions. Training is unchanged."""
+        num_inference_steps = int(num_inference_steps)
+        num_train_timesteps = self.noise_scheduler.config.num_train_timesteps
+        if not 1 <= num_inference_steps <= num_train_timesteps:
+            raise ValueError(
+                f"num_inference_steps must be in [1, {num_train_timesteps}], "
+                f"got {num_inference_steps}"
+            )
+        # sets the strided timesteps once, not per sampling call
+        self.noise_scheduler.set_timesteps(num_inference_steps)
+        self.num_inference_steps = num_inference_steps
 
     def forward(
         self,
@@ -829,10 +850,10 @@ class DiffusionPolicy(nn.Module):
         loss_dict = {"total_loss": loss.detach().cpu().item()}
         return None, loss, loss_dict
 
-    def normalize_data(self, data):
+    def normalize_data(self, data: torch.Tensor) -> torch.Tensor:
         return self.normalizer.normalize(data)
 
-    def unnormalize_data(self, data):
+    def unnormalize_data(self, data: torch.Tensor) -> torch.Tensor:
         return self.normalizer.unnormalize(data)
 
     def _predict(
@@ -876,10 +897,11 @@ class DiffusionPolicy(nn.Module):
         noisy_action = torch.randn((B, self.pred_horizon, self.action_dim), device=device, dtype=next(self.noise_pred_net.parameters()).dtype)
         naction = noisy_action
 
-        self.noise_scheduler.set_timesteps(self.num_diffusion_iters)
         for k in self.noise_scheduler.timesteps:
             noise_pred = self.ema_noise_pred_net(sample=naction, timestep=k, cond=obs_cond)
-            naction = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
+            naction = self.noise_scheduler.step(
+                model_output=noise_pred, timestep=k, sample=naction, eta=self.ddim_eta
+            ).prev_sample
 
         naction = naction.detach()
         action_pred = self.unnormalize_data(naction)
@@ -895,7 +917,9 @@ class DiffusionPolicy(nn.Module):
     def get_ema_average(self):
         return self.ema.averaged_model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas):
+    def configure_optimizers(
+        self, weight_decay: float, learning_rate: float, betas: Sequence[float]
+    ) -> torch.optim.AdamW:
         optimizer = torch.optim.AdamW(
             params=self.noise_pred_net.parameters(),
             lr=self.lr,
@@ -905,8 +929,8 @@ class DiffusionPolicy(nn.Module):
         print("weight_decay:", self.weight_decay)
         return optimizer
 
-    def set_normalizer(self, normalizer):
+    def set_normalizer(self, normalizer: LinearNormalizer) -> None:
         self.normalizer = normalizer
 
-    def train(self, mode=True):
+    def train(self, mode: bool = True):
         super().train(mode)

@@ -1,7 +1,8 @@
 import einops
 import os
 import random
-from collections import deque
+import time
+from collections import defaultdict, deque
 from pathlib import Path
 
 import hydra
@@ -12,10 +13,13 @@ from omegaconf import OmegaConf
 
 import wandb
 from utils.video import VideoRecorder
+from utils.metrics_logger import MetricsLogger
 import pickle
 from datasets.core import (
+    FileEmbeddingDataset,
     TrajectoryEmbeddingDataset,
     TrajectorySlicerDataset,
+    embedding_cache_key,
     split_traj_datasets,
 )
 from envs.venv import SubprocVectorEnv
@@ -267,26 +271,68 @@ def main(cfg):
 
     ##############################################
 
-    print("Saving to {}".format(os.getcwd()))
-    video = VideoRecorder(dir_name=save_path)
-
-    # init datasets
-    dataset = hydra.utils.instantiate(cfg.dataset)
-    train_data, test_data = split_traj_datasets(
-        dataset,
-        train_fraction=cfg.train_fraction,
-        random_seed=cfg.seed,
-    )
+    # dataset/video already built above (before get_all_actions()); reuse them here
     use_libero_goal = cfg.data.get("use_libero_goal", False)
 
     precompute_embeddings = cfg.get("precompute_embeddings", True)
-    if precompute_embeddings:
-        train_data = TrajectoryEmbeddingDataset(
-            encoder, train_data, device='cpu', embed_goal=use_libero_goal
+    # the cached embeddings live in host RAM, not VRAM, and dominate it: fp16
+    # halves that at no cost to a frozen encoder's conditioning features
+    embedding_fp16 = cfg.get("embedding_fp16", False)
+    embedding_dtype = torch.float16 if embedding_fp16 else None
+    # "memmap" keeps the cache in a file instead, so host RAM stops being the
+    # ceiling on dataset size and the encoder pass is reused across runs
+    use_file_cache = precompute_embeddings and cfg.get("embedding_cache", "ram") in (
+        "file",
+        "memmap",  # what the option was called before the streams landed
+    )
+    precompute_start = time.perf_counter()
+    if use_file_cache:
+        cache_dir = cfg.get("embedding_cache_dir", None) or (
+            Path(cfg.env_vars.dataset_root) / "embedding_cache"
         )
-        test_data = TrajectoryEmbeddingDataset(
-            encoder, test_data, device='cpu', embed_goal=use_libero_goal
+        np_dtype = np.float16 if embedding_fp16 else np.float32
+        cache_key = embedding_cache_key(
+            OmegaConf.to_yaml(cfg.encoder, resolve=True),
+            cfg.dataset.data_directory,
+            cfg.dataset.get("subset_fraction", None),
+            np_dtype().dtype.name,
+            use_libero_goal,
         )
+        # recorded in the manifest so a cache directory says what made it
+        encoder_ref = {
+            "hub_repo": cfg.encoder.get("hub_repo", ""),
+            "name": cfg.encoder.get("name", ""),
+            "feature_key": cfg.encoder.get("feature_key", ""),
+        }
+        embedded = FileEmbeddingDataset(
+            encoder, dataset, cache_dir, cache_key,
+            dtype=np_dtype, embed_goal=use_libero_goal,
+            encoder=encoder_ref, dataset_name=Path(cfg.dataset.data_directory).name,
+        )
+        # split after embedding: random_split_traj only sees len(dataset), which
+        # is unchanged, so a given seed picks the same episodes either way
+        train_data, test_data = split_traj_datasets(
+            embedded,
+            train_fraction=cfg.train_fraction,
+            random_seed=cfg.seed,
+        )
+    else:
+        train_data, test_data = split_traj_datasets(
+            dataset,
+            train_fraction=cfg.train_fraction,
+            random_seed=cfg.seed,
+        )
+        if precompute_embeddings:
+            train_data = TrajectoryEmbeddingDataset(
+                encoder, train_data, device='cpu', embed_goal=use_libero_goal,
+                dtype=embedding_dtype,
+            )
+            test_data = TrajectoryEmbeddingDataset(
+                encoder, test_data, device='cpu', embed_goal=use_libero_goal,
+                dtype=embedding_dtype,
+            )
+    precompute_s = time.perf_counter() - precompute_start
+    print(f"Embedding precompute took {precompute_s:.1f} s")
     traj_slicer_kwargs = {
         "window": cfg.data.window_size,
         "action_window": cfg.data.action_window_size,
@@ -324,7 +370,7 @@ def main(cfg):
             for i in range(10):
             # for i in range(len(dataset) // 50):
                 idx = i * 50
-                last_obs, _, _ = dataset.get_frames(idx, [-1])  # 1 V C H W
+                last_obs = dataset.get_frames(idx, [-1])["obs"]  # 1 V C H W
                 last_obs = last_obs.to(cfg.device)
                 embd = encoder(last_obs)[0]  # V P E
                 assert embd.ndim == 3, "expect V P E here"
@@ -339,6 +385,11 @@ def main(cfg):
         def goal_fn(goal_idx):
             return empty_tensor
 
+    # train_data/test_data hold the embeddings now, and the LIBERO-goal branch
+    # above (if any) already read the raw frames it needs from dataset, so the
+    # prefetched raw episodes can be freed instead of staying resident for the run.
+    if precompute_embeddings and getattr(dataset, "prefetch", False):
+        dataset.obses = None
 
     @torch.no_grad()
     def eval_on_env(
@@ -364,6 +415,10 @@ def main(cfg):
             if videorecorder is not None:
                 videorecorder.init(enabled=True)
             obs_stack = deque(maxlen=cfg.eval_window_size)
+            if cfg.env.gym.id == "pusht":
+                # PushTEnv.reset rebuilds its RNG from the seed, so each batch needs its own seeds
+                base_seed = cfg.seed + goal_idx * cfg.num_envs
+                env.seed([base_seed + j for j in range(cfg.num_envs)])
             this_obs = env.reset(goal_idx=goal_idx)  # N V C H W
             print(f"Eval on goal {goal_idx}/{num_batches}, {cfg.num_envs} episodes")
             assert (
@@ -423,8 +478,6 @@ def main(cfg):
                 goal = goal_fn(goal_idx)
             avg_reward += total_reward
             if cfg.env.gym.id == "pusht":
-                base_seed = cfg.seed + goal_idx * cfg.num_envs
-                env.seed([base_seed + j for j in range(cfg.num_envs)])
                 avg_max_coverage += [info[i]["max_coverage"] for i in range(len(info))]
                 avg_final_coverage += [info[i]["final_coverage"] for i in range(len(info))]
             elif cfg.env.gym.id in ["blockpush", "cube"]:
@@ -468,20 +521,54 @@ def main(cfg):
         resume_best_eval_metric if resume_best_eval_metric is not None else float("-inf")
     )
 
+    # x-axis of every logged series: optimizer steps done so far. One step per
+    # batch, so a resumed run at start_epoch continues on the same step values.
+    steps_per_epoch = len(train_loader)
+    metrics_logger = MetricsLogger(
+        save_path / "tensorboard",
+        accelerator.is_main_process,
+        purge_step=start_epoch * steps_per_epoch if start_epoch > 0 else None,
+    )
+    if start_epoch == 0:
+        metrics_logger.log_config(cfg)
+        metrics_logger.log_scalars({"time/precompute_s": precompute_s}, step=0)
+    # peak of the setup phase (embedding precompute), resets the counters
+    metrics_logger.log_peak_vram(step=start_epoch * steps_per_epoch)
+
+    def set_inference_steps(num_inference_steps):
+        # denoising steps for rollouts; set on the model object in use, so it
+        # also applies to checkpoints loaded through load_path
+        if use_diffusion:
+            accelerator.unwrap_model(cbet_model).set_inference_steps(num_inference_steps)
+
+    def rollout_scalars(metrics):
+        return {"rollout/{}".format(k.replace(" ", "_")): v for k, v in metrics.items()}
+
+    # per-step data/GPU timers sync the GPU twice per step, which slows training
+    log_step_times = cfg.get("log_step_times", False)
+
     for epoch in tqdm.trange(start_epoch, cfg.epochs):
+        epoch_start_step = epoch * steps_per_epoch
         accelerator.wait_for_everyone()
         cbet_model.eval()
         if (epoch + 1) % cfg.eval_on_env_freq == 0:
+            set_inference_steps(cfg.get("rollout_inference_steps", 100))
+            rollout_start = time.perf_counter()
             avg_reward, completion_id_list, max_coverage, final_coverage = eval_on_env(
                 cfg,
                 videorecorder=video,
                 epoch=epoch,
             )
+            metrics_logger.log_scalars(
+                {"time/rollout_s": time.perf_counter() - rollout_start},
+                step=epoch_start_step, epoch=epoch,
+            )
             reward_history.append(avg_reward)
             with open("{}/completion_idx_{}.json".format(save_path, epoch), "wb") as fp:
                 pickle.dump(completion_id_list, fp)
-            if accelerator.is_main_process:
-                wandb.log({"eval_on_env": avg_reward, "epoch": epoch})
+            metrics_logger.log_scalars(
+                {"rollout/avg_reward": avg_reward}, step=epoch_start_step, epoch=epoch
+            )
             metrics = None
             if cfg.env.gym.id in ["pusht", "blockpush", "cube"]:
                 metric_final = (
@@ -497,8 +584,9 @@ def main(cfg):
                     f"{metric_max} min": min(max_coverage),
                 }
                 print("final coverage mean: ", sum(final_coverage) / len(final_coverage))
-                if accelerator.is_main_process:
-                    wandb.log({**metrics, "epoch": epoch})
+                metrics_logger.log_scalars(
+                    rollout_scalars(metrics), step=epoch_start_step, epoch=epoch
+                )
                 metrics_history.append(metrics)
 
             # Save the ckpt only when this eval beats all previous evals on the
@@ -531,27 +619,32 @@ def main(cfg):
             logger.info(f"Process {accelerator.local_process_index} synchronized after eval_on_env")
 
         if epoch % cfg.eval_freq == 0:
+            eval_start = time.perf_counter()
             total_loss = 0
             action_diff = 0
             action_diff_tot = 0
             action_diff_mean_res1 = 0
             action_diff_mean_res2 = 0
             action_diff_max = 0
+            eval_sums = defaultdict(float)
             with torch.no_grad():
                 for data in test_loader:
-                    obs, act, goal = (x.to(cfg.device, non_blocking=True) for x in data)
+                    obs = data["obs"].to(cfg.device, non_blocking=True)
+                    act = data["action"].to(cfg.device, non_blocking=True)
+                    goal = data["goal"].to(cfg.device, non_blocking=True)
                     if not precompute_embeddings:
                         obs = encoder(obs)  # N T V P E
                         if use_libero_goal:
                             goal = encoder(goal)  # N T V P E
+                    obs, goal = obs.float(), goal.float()
                     assert obs.ndim == 5, "expect N T V P E for obs"
                     assert goal.ndim == 5, "expect N T V P E for goals"
                     obs = einops.rearrange(obs, "N T V P E -> N T (V P) E") # keep the patch dim
                     goal = einops.rearrange(goal, "N T V P E -> N T (V P) E")
                     predicted_act, loss, loss_dict = cbet_model(obs, goal, act)
                     total_loss += loss.item()
-                    if accelerator.is_main_process:
-                        wandb.log({**{"eval/{}".format(x): y for (x, y) in loss_dict.items()}, "epoch": epoch})
+                    for x, y in loss_dict.items():
+                        eval_sums[x] += y
                     if not use_diffusion:
                         action_diff += loss_dict["action_diff"]
                         action_diff_tot += loss_dict["action_diff_tot"]
@@ -559,23 +652,45 @@ def main(cfg):
                         action_diff_mean_res2 += loss_dict["action_diff_mean_res2"]
                         action_diff_max += loss_dict["action_diff_max"]
             print(f"Test loss: {total_loss / len(test_loader)}")
-            if accelerator.is_main_process and not use_diffusion:
-                wandb.log({"eval/epoch_wise_action_diff": action_diff, "epoch": epoch})
-                wandb.log({"eval/epoch_wise_action_diff_tot": action_diff_tot, "epoch": epoch})
-                wandb.log({"eval/epoch_wise_action_diff_mean_res1": action_diff_mean_res1, "epoch": epoch})
-                wandb.log({"eval/epoch_wise_action_diff_mean_res2": action_diff_mean_res2, "epoch": epoch})
-                wandb.log({"eval/epoch_wise_action_diff_max": action_diff_max, "epoch": epoch})
+            eval_scalars = {
+                "eval/{}".format(x): y / len(test_loader) for x, y in eval_sums.items()
+            }
+            if not use_diffusion:
+                eval_scalars.update({
+                    "eval/epoch_wise_action_diff": action_diff,
+                    "eval/epoch_wise_action_diff_tot": action_diff_tot,
+                    "eval/epoch_wise_action_diff_mean_res1": action_diff_mean_res1,
+                    "eval/epoch_wise_action_diff_mean_res2": action_diff_mean_res2,
+                    "eval/epoch_wise_action_diff_max": action_diff_max,
+                })
+            eval_scalars["time/eval_s"] = time.perf_counter() - eval_start
+            metrics_logger.log_scalars(eval_scalars, step=epoch_start_step, epoch=epoch)
 
         accelerator.wait_for_everyone()
         cbet_model.train()
         train_loss = 0
-        for data in tqdm.tqdm(train_loader):
+        train_sums = defaultdict(float)
+        step_times = {}
+        time_sums = defaultdict(float)
+        train_start = time.perf_counter()
+        if log_step_times:
+            data_start = time.perf_counter()
+        for i, data in enumerate(tqdm.tqdm(train_loader)):
             optimizer.zero_grad()
-            obs, act, goal = (x.to(cfg.device, non_blocking=True) for x in data)
+            obs = data["obs"].to(cfg.device, non_blocking=True)
+            act = data["action"].to(cfg.device, non_blocking=True)
+            goal = data["goal"].to(cfg.device, non_blocking=True)
+            if log_step_times:
+                torch.cuda.synchronize()
+                step_start = time.perf_counter()
+                # data_s: loader (slice, collate, pin) plus the copy to the GPU
+                step_times = {"time/data_s": step_start - data_start}
             if not precompute_embeddings:
                 obs = encoder(obs)  # N T V P E
                 if use_libero_goal:
                     goal = encoder(goal)  # N T V P E
+            # fp16 cache: upcast on the GPU, so the copy above moves half the bytes
+            obs, goal = obs.float(), goal.float()
             obs = einops.rearrange(obs, "N T V P E -> N T (V P) E")
             goal = einops.rearrange(goal, "N T V P E -> N T (V P) E")
             predicted_act, loss, loss_dict = cbet_model(obs, goal, act)
@@ -589,9 +704,22 @@ def main(cfg):
                     cbet_model_raw.ema_step()
                 else:
                     cbet_model.ema_step()
+            if log_step_times:
+                torch.cuda.synchronize()
+                # step_s: forward, backward, optimizer and EMA on the GPU
+                step_times["time/step_s"] = time.perf_counter() - step_start
 
-            if accelerator.is_main_process:
-                wandb.log({**{"train/{}".format(x): y for (x, y) in loss_dict.items()}, "epoch": epoch})
+            for x, y in loss_dict.items():
+                train_sums[x] += y
+            for x, y in step_times.items():
+                time_sums[x] += y
+            metrics_logger.log_scalars(
+                {**{"train/{}".format(x): y for x, y in loss_dict.items()}, **step_times},
+                step=epoch_start_step + i + 1,
+                epoch=epoch,
+            )
+            if log_step_times:
+                data_start = time.perf_counter()
 
         if hasattr(cbet_model, "module"):
             if hasattr(accelerator.unwrap_model(cbet_model), "finish_epoch"):
@@ -600,6 +728,19 @@ def main(cfg):
             if hasattr(cbet_model, "finish_epoch"):
                 cbet_model.finish_epoch()
         print(f"Train loss: {train_loss / len(train_loader)}")
+        epoch_end_step = (epoch + 1) * steps_per_epoch
+        metrics_logger.log_scalars(
+            {"train/epoch_{}".format(x): y / len(train_loader) for x, y in train_sums.items()},
+            step=epoch_end_step,
+            epoch=epoch,
+        )
+        epoch_times = {"time/train_epoch_s": time.perf_counter() - train_start}
+        if log_step_times:
+            epoch_times["time/epoch_data_s"] = time_sums["time/data_s"]
+            epoch_times["time/epoch_step_s"] = time_sums["time/step_s"]
+        metrics_logger.log_scalars(epoch_times, step=epoch_end_step, epoch=epoch)
+        # covers this epoch's rollouts, test-set eval and training steps
+        metrics_logger.log_peak_vram(step=epoch_end_step, epoch=epoch)
 
         # Save a resume snapshot every epoch (preemptable support). This is
         # independent of the best-eval-gated model_{epoch}.pt above: the
@@ -607,15 +748,26 @@ def main(cfg):
         # job can be requeued and continue from the next epoch.
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            snapshot_start = time.perf_counter()
             save_snapshot(save_path, cbet_model, optimizer, accelerator, epoch,
                           wandb_run_id, metrics_history, reward_history,
                           best_eval_metric)
+            metrics_logger.log_scalars(
+                {"time/snapshot_s": time.perf_counter() - snapshot_start},
+                step=epoch_end_step, epoch=epoch,
+            )
 
+    set_inference_steps(cfg.get("final_inference_steps", 100))
+    final_eval_start = time.perf_counter()
     avg_reward, completion_id_list, max_coverage, final_coverage = eval_on_env(
         cfg,
         num_evals=cfg.num_final_evals,
         videorecorder=video,
         epoch=cfg.epochs,
+    )
+    metrics_logger.log_scalars(
+        {"time/final_eval_s": time.perf_counter() - final_eval_start},
+        step=cfg.epochs * steps_per_epoch, epoch=cfg.epochs,
     )
 
     # Synchronize all processes after final eval_on_env
@@ -629,6 +781,9 @@ def main(cfg):
     print(f"Final eval, always saving ckpt to {save_path}/model_final.pt")
     save_model("final", force=True)
     reward_history.append(avg_reward)
+    metrics_logger.log_scalars(
+        {"rollout/avg_reward": avg_reward}, step=cfg.epochs * steps_per_epoch, epoch=cfg.epochs
+    )
     if cfg.env.gym.id in ["pusht", "blockpush", "cube"]:
         metric_final = "final coverage" if cfg.env.gym.id == "pusht" else "entered"
         metric_max = "max coverage" if cfg.env.gym.id == "pusht" else "moved"
@@ -640,8 +795,9 @@ def main(cfg):
             f"{metric_max} max": max(max_coverage),
             f"{metric_max} min": min(max_coverage),
         }
-        if accelerator.is_main_process:
-            wandb.log({**metrics, "epoch": cfg.epochs})
+        metrics_logger.log_scalars(
+            rollout_scalars(metrics), step=cfg.epochs * steps_per_epoch, epoch=cfg.epochs
+        )
         metrics_history.append(metrics)
 
     with open("{}/completion_idx_final.json".format(save_path), "wb") as fp:
@@ -652,8 +808,12 @@ def main(cfg):
         final_eval_on_env = max([x["entered mean"] for x in metrics_history])
     else:  # libero_goal and anything else without a coverage-style metric
         final_eval_on_env = max(reward_history)
-    if accelerator.is_main_process:
-        wandb.log({"final_eval_on_env": final_eval_on_env, "epoch": cfg.epochs})
+    metrics_logger.log_scalars(
+        {"rollout/best_final_eval": final_eval_on_env},
+        step=cfg.epochs * steps_per_epoch,
+        epoch=cfg.epochs,
+    )
+    metrics_logger.close()
     return final_eval_on_env
 
 

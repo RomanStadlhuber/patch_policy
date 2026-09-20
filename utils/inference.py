@@ -36,6 +36,7 @@ def embed_trajectory_dataset(
     obs_only=True,
     device=None,
     embed_goal=False,
+    dtype=None,
 ):  
     if False:
     # if type(model) is nn.parallel.DistributedDataParallel:
@@ -45,6 +46,7 @@ def embed_trajectory_dataset(
             obs_only=obs_only,
             device=device,
             embed_goal=embed_goal,
+            dtype=dtype,
         )
     else:
         print("########## Embedding dataset on single device")
@@ -56,24 +58,28 @@ def embed_trajectory_dataset(
 
         with eval_mode(model, no_grad=True):
             for i in tqdm(range(len(dataset)), total=len(dataset)):
-                obs, *rest = dataset[i]
-                obs = obs.to(model_device)
+                sample = dataset[i]
+                obs = sample["obs"].to(model_device)
                 obs_enc = model(obs)
-                obs_enc = obs_enc.detach().to(result_device)
+                # dtype halves the cached embeddings: the encoder is frozen, so
+                # these are conditioning inputs, never accumulated gradients
+                obs_enc = obs_enc.detach().to(result_device, dtype=dtype)
 
                 if obs_only:
                     result.append(obs_enc)
                 else:
+                    embedded = {
+                        name: value.to(result_device)
+                        for name, value in sample.items()
+                        if name != "obs"
+                    }
                     if embed_goal:
-                        # assuming goal comes last
-                        goal = rest[-1]
-                        rest = rest[:-1]
-                        goal = goal.to(model_device)
-                        goal_enc = model(goal)
-                        goal_enc = goal_enc.detach().to(result_device)
-                        rest.append(goal_enc)
-                    rest = [x.to(result_device) for x in rest]
-                    result.append((obs_enc, *rest))
+                        goal_enc = model(sample["goal"].to(model_device))
+                        embedded["goal"] = goal_enc.detach().to(
+                            result_device, dtype=dtype
+                        )
+                    embedded["obs"] = obs_enc
+                    result.append(embedded)
         return result
 
 
@@ -83,6 +89,7 @@ def embed_trajectory_dataset_ddp(
     obs_only=True,
     device=None,
     embed_goal=False,
+    dtype=None,
 ):
     assert type(model) is nn.parallel.DistributedDataParallel, "Model must be DDP"
     embeddings = []
@@ -98,25 +105,29 @@ def embed_trajectory_dataset_ddp(
     # get the max trajectory length, so that we can pad tensors for DDP gather
     max_T = max(dataset.get_seq_length(i) for i in range(len(dataset)))
     with eval_mode(model, no_grad=True):
-        for obs, *rest in dataloader:
-            obs = obs.to(accelerator.device)  # obs shape 1 T V C H W
+        for batch in dataloader:
+            obs = batch["obs"].to(accelerator.device)  # obs shape 1 T V C H W
             obs_enc = model(obs)
             obs_enc = pad_to_length(obs_enc, max_T, dim=1)
             obs_enc = accelerator.gather_for_metrics(obs_enc)
             if obs_only:
                 embeddings.append(obs_enc)
             else:
+                rest = {
+                    name: value.to(accelerator.device)
+                    for name, value in batch.items()
+                    if name != "obs"
+                }
                 if embed_goal:
-                    # assuming goal comes last
-                    goal = rest[-1]
-                    rest = rest[:-1]
-                    goal = goal.to(accelerator.device)
-                    goal_enc = model(goal)
-                    rest.append(goal_enc)
-                rest = [x.to(accelerator.device) for x in rest]
-                rest = [pad_to_length(x, max_T, dim=1) for x in rest]
-                rest = [accelerator.gather_for_metrics(x) for x in rest]
-                embeddings.append((obs_enc, *rest))
+                    rest["goal"] = model(batch["goal"].to(accelerator.device))
+                rest = {
+                    name: accelerator.gather_for_metrics(
+                        pad_to_length(value, max_T, dim=1)
+                    )
+                    for name, value in rest.items()
+                }
+                rest["obs"] = obs_enc
+                embeddings.append(rest)
 
     device = device or accelerator.device
     # unpad the tensors
@@ -125,14 +136,19 @@ def embed_trajectory_dataset_ddp(
         embeddings = torch.cat(embeddings, dim=0)
         assert len(embeddings) == len(dataset)
     else:
-        embeddings = [torch.cat(x, dim=0) for x in zip(*embeddings)]
-        assert len(embeddings[0]) == len(dataset)
+        names = list(embeddings[0].keys())
+        embeddings = {
+            name: torch.cat([e[name] for e in embeddings], dim=0) for name in names
+        }
+        assert len(embeddings["obs"]) == len(dataset)
     for i in range(len(dataset)):
         T = dataset.get_seq_length(i)
         if obs_only:
             result.append(embeddings[i, :T].to(device))
         else:
-            result.append([x[i, :T].to(device) for x in embeddings])
+            result.append(
+                {name: value[i, :T].to(device) for name, value in embeddings.items()}
+            )
     return result
 
 

@@ -35,6 +35,14 @@ n_action_steps: ${action_window_size} # Action steps to roll out
 
 precompute_embeddings: False
 
+# denoising steps when sampling actions with DDIM; training always uses num_train_timesteps.
+rollout_inference_steps: 100  # rollouts during training
+final_inference_steps: 100  # final eval after training
+ddim_eta: 0.0  # 0.0 samples deterministically, 1.0 adds as much noise per step as DDPM
+# log per-step loader and GPU times (time/data_s, time/step_s) to TensorBoard.
+# Useful to debug training performance. Syncs the GPU twice per step, which slows training.
+log_step_times: false
+
 goal_dim: 0
 wandb:
   project: patch_policy
@@ -92,3 +100,7 @@ model:
   weight_decay: ${optim.weight_decay}
   use_transform: null
   n_patches: ${encoder.n_patches}
+  num_train_timesteps: 100
+  num_inference_steps: ${rollout_inference_steps}
+  ddim_eta: ${ddim_eta}
+  timestep_spacing: trailing

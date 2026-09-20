@@ -19,12 +19,17 @@ This repo contains code for training and reproducing sim environment experiments
 
 ## Setup
 
-Create the conda environment (this installs everything, including the CUDA build of PyTorch):
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). It installs Python 3.9 and
+everything else, including the CUDA build of PyTorch:
 
 ```
-conda env create -f conda_env.yml
-conda activate patch-policy
+uv sync                     # Push-T only
+uv sync --all-extras        # all four environments
 ```
+
+Extras are per environment: `--extra blockpush`, `--extra libero`, `--extra cube`.
+Run commands through `uv run` (e.g. `uv run python train_policy.py ...`), or activate the
+environment with `source .venv/bin/activate`.
 
 Tested on Ubuntu 22.04 with CUDA 12.8. To log training runs, log in to Weights & Biases with `wandb login` (or set `export WANDB_MODE=disabled` to turn logging off). In `./configs/env_vars/env_vars.yaml`, set `wandb_entity` to your wandb username.
 
@@ -40,29 +45,36 @@ The datasets for all four simulation environments are hosted on the Hugging Face
 | LIBERO Goal    | `libero_dataset`     | 7.7 GB   |
 | Block Pushing  | `block_push_dataset` | 5.9 GB   |
 
+### Where the data lives
+
+All datasets go to `~/data`, the dataset directory of this machine. Keep data out of the
+repository. This repo uses:
+
+```
+~/data/patch_policy_datasets/
+```
+
 ### Download
 
-1. Install the Hugging Face Hub CLI:
+1. The Hugging Face Hub CLI is part of the environment already (`uv sync`).
+2. Download the dataset repo to that directory (all four datasets live in it):
    ```
-   pip install "huggingface_hub==0.36.2"
-   ```
-2. Download the dataset repo to a local directory (this is the directory all four datasets will live in):
-   ```
-   huggingface-cli download gaoyuezhou/patch-policy-datasets \
-     --repo-type dataset --local-dir patch_policy_datasets
+   uv run hf download gaoyuezhou/patch-policy-datasets \
+     --repo-type dataset --local-dir ~/data/patch_policy_datasets
    ```
    To download only a subset, add e.g. `--include "pusht_dataset.zip"`.
 3. Unzip each dataset in place:
    ```
-   cd patch_policy_datasets
-   for f in *.zip; do unzip -q "$f"; done
+   cd ~/data/patch_policy_datasets
+   for f in *.zip; do unzip -q "$f" && rm "$f"; done
    ```
 
 ### Point the code at the data
 
 The dataloading code reads from a single `dataset_root` directory — no code changes are needed, you only set this path.
 
-- In `./configs/env_vars/env_vars.yaml`, set `dataset_root` to the unzipped directory (e.g. the absolute path to `patch_policy_datasets`), and set `save_path` to where you want training/rollout results saved (e.g. the root directory of this repo).
+- In `./configs/env_vars/env_vars.yaml`, set `dataset_root` to the unzipped directory (here `~/data/patch_policy_datasets`, written as an absolute path), and set `save_path` to where you want training/rollout results saved (e.g. the root directory of this repo).
+- You can also override it per run: `uv run python train_policy.py --config-name train_pusht env_vars.dataset_root=/other/path`.
 
 The expected layout under `dataset_root` is:
 ```

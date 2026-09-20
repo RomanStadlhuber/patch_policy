@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Optional
 from torch.nn.utils.rnn import pad_sequence
 from datasets.core import TrajectoryDataset
+from typing import Sequence
+
+from datasets.types import Sample
 
 
 class LiberoGoalDataset(TrajectoryDataset):
@@ -85,14 +88,14 @@ class LiberoGoalDataset(TrajectoryDataset):
         self.goals = None
         goals = []
         for i in range(0, len(self.demos), 50):
-            last_obs, _, _ = self.get_frames(i, [-1])  # 1 V C H W
+            last_obs = self.get_frames(i, [-1])["obs"]  # 1 V C H W
             goals.append(last_obs)
         self.goals = goals
 
     def __len__(self):
         return len(self.demos)
 
-    def get_frames(self, idx, frames):
+    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
         demo = self.demos[idx]
         agentview_obs = torch.load(
             str(demo / "agentview_image.pth"),
@@ -108,14 +111,13 @@ class LiberoGoalDataset(TrajectoryDataset):
             obs = obs[:, self.view_idx : self.view_idx + 1]
 
         act = self.actions[idx][frames]
+        sample: Sample = {"obs": obs, "action": act}
         if self.goals is not None:
             task_idx = idx // 50
-            goal = self.goals[task_idx].repeat(len(frames), 1, 1, 1, 1)
-            return obs, act, goal
-        else:
-            return obs, act, None
+            sample["goal"] = self.goals[task_idx].repeat(len(frames), 1, 1, 1, 1)
+        return sample
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Sample:
         return self.get_frames(idx, range(len(self.joint_pos[idx])))
 
     def get_seq_length(self, idx):

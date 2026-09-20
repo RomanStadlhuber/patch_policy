@@ -4,6 +4,9 @@ import pickle
 from pathlib import Path
 from typing import Optional
 from datasets.core import TrajectoryDataset
+from typing import Sequence
+
+from datasets.types import Sample
 
 # import numpy as np
 # from torch.serialization import safe_globals
@@ -19,7 +22,6 @@ class CubeDataset(TrajectoryDataset):
         **kwargs,
     ):
         self.data_directory = Path(data_directory)
-        self.states = torch.load(self.data_directory / "latents.pth")
         self.actions = torch.load(self.data_directory / "actions.pth")
         with open(self.data_directory / "seq_lengths.pkl", "rb") as f:
             self.seq_lengths = pickle.load(f)
@@ -27,11 +29,10 @@ class CubeDataset(TrajectoryDataset):
         self.subset_fraction = subset_fraction
         if self.subset_fraction:
             assert self.subset_fraction > 0 and self.subset_fraction <= 1
-            n = int(len(self.states) * self.subset_fraction)
+            n = int(len(self.seq_lengths) * self.subset_fraction)
         else:
-            n = len(self.states)
+            n = len(self.seq_lengths)
 
-        self.states = self.states[:n]
         self.actions = self.actions[:n]
         self.seq_lengths = self.seq_lengths[:n]
 
@@ -57,7 +58,7 @@ class CubeDataset(TrajectoryDataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
-    def get_frames(self, idx, frames):
+    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
         if self.prefetch:
             obs = self.obses[idx][frames]
         else:
@@ -69,12 +70,10 @@ class CubeDataset(TrajectoryDataset):
         obs = einops.rearrange(obs, "T H W C -> T 1 C H W") / 255.0  # T V C H W, 1 view
         obs = torch.from_numpy(obs).float()
         act = self.actions[idx, frames]
-        mask = torch.ones(len(act)).bool()
         dummy_goal = torch.ones([obs.shape[0], 1, 1, 1]) # dummy goal, T V P E
-        # return obs, act, mask, goal
-        return obs, act, dummy_goal
+        return {"obs": obs, "action": act, "goal": dummy_goal}
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Sample:
         return self.get_frames(idx, range(self.get_seq_length(idx)))
 
     def __len__(self):
