@@ -17,6 +17,7 @@ or use it from Python:
 """
 
 import argparse
+import signal
 import subprocess
 import sys
 import threading
@@ -171,13 +172,15 @@ def main() -> None:
     probe = GpuProbe(
         interval_ms=args.interval_ms, gpu_index=args.gpu, report_s=args.report_s
     )
+    # a background job started from a non-interactive shell inherits SIGINT
+    # ignored, so a launcher can only stop this with SIGTERM
+    done = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: done.set())
+
     probe.start()
     try:
-        if args.duration_s is None:
-            while True:
-                time.sleep(0.5)
-        else:
-            time.sleep(args.duration_s)
+        done.wait(timeout=args.duration_s)
     except KeyboardInterrupt:
         pass
     finally:
