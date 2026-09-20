@@ -5,6 +5,9 @@ import numpy as np
 from pathlib import Path
 from typing import Optional
 from datasets.core import TrajectoryDataset
+from typing import Sequence
+
+from datasets.types import Sample
 
 
 class PushMultiviewTrajectoryDataset(TrajectoryDataset):
@@ -56,7 +59,7 @@ class PushMultiviewTrajectoryDataset(TrajectoryDataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
-    def get_frames(self, idx, frames):
+    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
         if self.prefetch:
             obs = self.obses[idx][frames]
         else:
@@ -67,16 +70,13 @@ class PushMultiviewTrajectoryDataset(TrajectoryDataset):
         if self.view_idx is not None:
             obs = obs[:, self.view_idx : self.view_idx + 1]
         act = self.actions[idx, frames]
-        mask = self.masks[idx, frames]
         if self.onehot_goals:
             goal = self.goals[idx, frames]
-            # return obs, act, mask, goal
-            return obs, act, goal
         else:
-            dummy_goal = torch.ones([obs.shape[0], 1, 1, 1]) # dummy goal, T V P E
-            return obs, act, dummy_goal
+            goal = torch.ones([obs.shape[0], 1, 1, 1]) # dummy goal, T V P E
+        return {"obs": obs, "action": act, "goal": goal}
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Sample:
         T = self.masks[idx].sum().int().item()
         return self.get_frames(idx, range(T))
 

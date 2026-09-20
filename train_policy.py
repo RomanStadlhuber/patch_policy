@@ -360,7 +360,7 @@ def main(cfg):
             for i in range(10):
             # for i in range(len(dataset) // 50):
                 idx = i * 50
-                last_obs, _, _ = dataset.get_frames(idx, [-1])  # 1 V C H W
+                last_obs = dataset.get_frames(idx, [-1])["obs"]  # 1 V C H W
                 last_obs = last_obs.to(cfg.device)
                 embd = encoder(last_obs)[0]  # V P E
                 assert embd.ndim == 3, "expect V P E here"
@@ -619,7 +619,9 @@ def main(cfg):
             eval_sums = defaultdict(float)
             with torch.no_grad():
                 for data in test_loader:
-                    obs, act, goal = (x.to(cfg.device, non_blocking=True) for x in data)
+                    obs = data["obs"].to(cfg.device, non_blocking=True)
+                    act = data["action"].to(cfg.device, non_blocking=True)
+                    goal = data["goal"].to(cfg.device, non_blocking=True)
                     if not precompute_embeddings:
                         obs = encoder(obs)  # N T V P E
                         if use_libero_goal:
@@ -665,7 +667,9 @@ def main(cfg):
             data_start = time.perf_counter()
         for i, data in enumerate(tqdm.tqdm(train_loader)):
             optimizer.zero_grad()
-            obs, act, goal = (x.to(cfg.device, non_blocking=True) for x in data)
+            obs = data["obs"].to(cfg.device, non_blocking=True)
+            act = data["action"].to(cfg.device, non_blocking=True)
+            goal = data["goal"].to(cfg.device, non_blocking=True)
             if log_step_times:
                 torch.cuda.synchronize()
                 step_start = time.perf_counter()

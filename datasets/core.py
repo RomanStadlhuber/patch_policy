@@ -8,7 +8,9 @@ import numpy as np
 from pathlib import Path
 from torch import default_generator, randperm
 from torch.utils.data import Dataset, Subset
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from datasets.types import Sample
 
 
 # Taken from python 3.5 docs
@@ -30,21 +32,19 @@ def _accumulate(iterable, fn=lambda x, y: x + y):
 class TrajectoryDataset(Dataset, abc.ABC):
     """
     A dataset containing trajectories.
-    TrajectoryDataset[i] returns: (observations, actions, mask)
-        observations: Tensor[T, ...], T frames of observations
-        actions: Tensor[T, ...], T frames of actions
-        mask: Tensor[T]: False: invalid; True: valid
+    TrajectoryDataset[i] returns a Sample: {"obs": ..., "action": ..., ...}
+        every tensor has time on axis 0, with the same length T
     """
 
     @abc.abstractmethod
-    def get_seq_length(self, idx):
+    def get_seq_length(self, idx: int) -> int:
         """
         Returns the length of the idx-th trajectory.
         """
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_frames(self, idx, frames):
+    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
         """
         Returns the frames from the idx-th trajectory at the specified frames.
         Used to speed up slicing.
@@ -64,13 +64,13 @@ class TrajectorySubset(TrajectoryDataset, Subset):
     def __init__(self, dataset: TrajectoryDataset, indices: Sequence[int]):
         Subset.__init__(self, dataset, indices)
 
-    def get_seq_length(self, idx):
+    def get_seq_length(self, idx: int) -> int:
         return self.dataset.get_seq_length(self.indices[idx])
 
-    def get_all_actions(self):
+    def get_all_actions(self) -> torch.Tensor:
         return self.dataset.get_all_actions()
 
-    def get_frames(self, idx, frames):
+    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
         return self.dataset.get_frames(self.indices[idx], frames)
 
 
@@ -81,7 +81,7 @@ class TrajectorySlicerDataset(Dataset):
 
     dataset: a trajectory dataset that satisfies:
         dataset.get_seq_length(i) returns the length of sequence i
-        dataset.get_frames(i, frames) = (observations, actions, *others), each sliced to frames
+        dataset.get_frames(i, frames) -> Sample, each stream sliced to frames
         observations: Tensor[T, ...]
         actions: Tensor[T, ...]
     window: int
@@ -172,7 +172,7 @@ class TrajectorySlicerDataset(Dataset):
     def __len__(self):
         return len(self.slices)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Sample:
         i, start, end = self.slices[idx]
         # fetch only the frames this slice needs (the union of the obs window and
         # the action window, which can extend past it) instead of the whole
@@ -181,24 +181,28 @@ class TrajectorySlicerDataset(Dataset):
         T = self.dataset.get_seq_length(i)
         # -1 due to overlap for 1 step between obs and act
         frame_end = min(end - 1 + self.action_window, T)
-        obs, act, *others = self.dataset.get_frames(i, range(start, frame_end))
-        rel_end = end - start  # obs/others only use the obs part of the fetched range
+        sample = self.dataset.get_frames(i, range(start, frame_end))
+        # "action" spans the action window; every other stream follows the
+        # observation window, which is the shorter of the two
+        act = sample["action"]
+        rel_end = end - start
+
+        values: Sample = {}
         if end - start < self.window:
-            obs_win = utils.inference.repeat_start_to_length(
-                obs[:rel_end], self.window, dim=0
-            )
             act = utils.inference.repeat_start_to_length(
                 act, self.window + self.action_window - 1, dim=0
             )
-            repeated_others = [
-                utils.inference.repeat_start_to_length(
-                    other[:rel_end], self.window, dim=0
+            for name, value in sample.items():
+                if name == "action":
+                    continue
+                values[name] = utils.inference.repeat_start_to_length(
+                    value[:rel_end], self.window, dim=0
                 )
-                for other in others
-            ]
         else:
-            obs_win = obs[:rel_end]
-            repeated_others = [other[:rel_end] for other in others]
+            for name, value in sample.items():
+                if name == "action":
+                    continue
+                values[name] = value[:rel_end]
 
         if self.vqbet_get_future_action_chunk:
             expected_len = self.action_window
@@ -214,12 +218,12 @@ class TrajectorySlicerDataset(Dataset):
                     f"Action chunk too short: {act.shape[0]} < {expected_len}, "
                     f"but pad_seq_length is False"
                 )
-        values = [obs_win, act, *repeated_others]
+        values["action"] = act
 
         # optionally apply transform
         if self.transform is not None:
             values = self.transform(values)
-        return tuple(values)
+        return values
 
 
 class TrajectoryEmbeddingDataset(TrajectoryDataset):
@@ -240,24 +244,24 @@ class TrajectoryEmbeddingDataset(TrajectoryDataset):
             dtype=dtype,
         )
         assert len(self.data) == len(dataset)
-        # one (obs, act, *others) tuple per episode, kept unpadded: padding to the
-        # longest episode doubles the RAM and every read takes a whole episode anyway
-        self.seq_lengths = [len(x[0]) for x in self.data]
+        # one Sample per episode, kept unpadded: padding to the longest episode
+        # doubles the RAM and every read takes a whole episode anyway
+        self.seq_lengths = [len(x["obs"]) for x in self.data]
 
-    def get_seq_length(self, idx):
+    def get_seq_length(self, idx: int) -> int:
         return self.seq_lengths[idx]
 
-    def get_all_actions(self):
-        return torch.cat([episode[1] for episode in self.data], dim=0)
+    def get_all_actions(self) -> torch.Tensor:
+        return torch.cat([episode["action"] for episode in self.data], dim=0)
 
-    def get_frames(self, idx, frames):
-        return [x[frames] for x in self.data[idx]]
+    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
+        return {name: value[frames] for name, value in self.data[idx].items()}
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Sample:
         # the stored tensors, not get_frames(range(...)): a range index copies the episode
-        return list(self.data[idx])
+        return dict(self.data[idx])
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.seq_lengths)
 
 
@@ -303,7 +307,7 @@ class FileEmbeddingDataset(TrajectoryDataset):
         meta = torch.load(self.meta_path, weights_only=False)
         self.seq_lengths = meta["seq_lengths"]
         self.offsets = meta["offsets"]
-        self.rest = meta["rest"]  # per-episode (act, goal, ...) tensors
+        self.rest: List[Sample] = [_as_sample(r) for r in meta["rest"]]
         self.frame_shape = tuple(meta["frame_shape"])
         assert len(self.seq_lengths) == len(dataset)
 
@@ -327,15 +331,15 @@ class FileEmbeddingDataset(TrajectoryDataset):
         accelerator = utils.inference.Accelerator()
         model_device = accelerator.device
         frame_shape: Optional[Tuple[int, ...]] = None
-        rest_all: List[List[torch.Tensor]] = []
+        rest_all: List[Sample] = []
 
         # written straight through: the pass is sequential, so a plain handle
         # avoids the dirty-page build-up a write-mode memmap accumulates
         with open(self.obs_path, "wb") as fh:
             with utils.inference.eval_mode(model, no_grad=True):
                 for i in utils.inference.tqdm(range(len(dataset)), total=len(dataset)):
-                    obs, *rest = dataset[i]
-                    obs_enc = model(obs.to(model_device)).detach()
+                    sample = dataset[i]
+                    obs_enc = model(sample["obs"].to(model_device)).detach()
                     if frame_shape is None:
                         # only known after the first forward pass
                         frame_shape = tuple(obs_enc.shape[1:])
@@ -345,13 +349,16 @@ class FileEmbeddingDataset(TrajectoryDataset):
                         .astype(self.dtype)
                         .tobytes()
                     )
+                    rest: Sample = {
+                        name: value.cpu()
+                        for name, value in sample.items()
+                        if name != "obs"
+                    }
                     if embed_goal:
-                        # assuming goal comes last
-                        goal = rest[-1].to(model_device)
-                        rest = rest[:-1] + [model(goal).detach().cpu()]
-                    rest_all.append(
-                        [x.cpu() if torch.is_tensor(x) else x for x in rest]
-                    )
+                        rest["goal"] = (
+                            model(sample["goal"].to(model_device)).detach().cpu()
+                        )
+                    rest_all.append(rest)
 
         torch.save(
             {
@@ -394,21 +401,32 @@ class FileEmbeddingDataset(TrajectoryDataset):
         return self.seq_lengths[idx]
 
     def get_all_actions(self) -> torch.Tensor:
-        return torch.cat([rest[0] for rest in self.rest], dim=0)
+        return torch.cat([rest["action"] for rest in self.rest], dim=0)
 
-    def get_frames(self, idx: int, frames: Sequence[int]) -> List[torch.Tensor]:
+    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
         length = self.seq_lengths[idx]
         local = np.asarray(frames, dtype=np.int64)
         # negative indices address the episode, not the row before it
         local = np.where(local < 0, local + length, local)
-        obs = self._read_rows(local + self.offsets[idx])
-        return [obs, *(x[local] for x in self.rest[idx])]
+        sample: Sample = {"obs": self._read_rows(local + self.offsets[idx])}
+        for name, value in self.rest[idx].items():
+            sample[name] = value[local]
+        return sample
 
-    def __getitem__(self, idx: int) -> List[torch.Tensor]:
+    def __getitem__(self, idx: int) -> Sample:
         return self.get_frames(idx, range(self.seq_lengths[idx]))
 
     def __len__(self) -> int:
         return len(self.seq_lengths)
+
+
+def _as_sample(rest: Any) -> Sample:
+    """Name the non-observation tensors of a cache written before Sample existed."""
+    if isinstance(rest, dict):
+        return rest
+    # positional order was (action, goal), per "assuming goal comes last"
+    names = ("action", "goal")
+    return {names[i]: value for i, value in enumerate(rest)}
 
 
 def embedding_cache_key(*parts: Any) -> str:
