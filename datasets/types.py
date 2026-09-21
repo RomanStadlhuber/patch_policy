@@ -5,7 +5,7 @@ These are hints, not validators. They exist so a reader can tell what a
 dataset classes and the slicer.
 """
 
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence
 
 try:  # TypedDict moved into typing in 3.8, but keep the fallback explicit
     from typing import TypedDict
@@ -28,6 +28,10 @@ class Sample(TypedDict, total=False):
     goal: torch.Tensor
     state: torch.Tensor
 
+
+#: per-stream frame lists passed to `get_frames`, overriding its `frames`
+#: for the streams they name
+StreamFrames = Mapping[str, Sequence[int]]
 
 #: streams that follow the observation window; everything else follows the
 #: action window, which extends past it

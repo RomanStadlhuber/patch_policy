@@ -4,10 +4,10 @@ import einops
 import numpy as np
 from pathlib import Path
 from typing import Optional
-from datasets.core import TrajectoryDataset
+from datasets.core import TrajectoryDataset, frames_for
 from typing import Sequence
 
-from datasets.types import Sample
+from datasets.types import Sample, StreamFrames
 
 
 class PushMultiviewTrajectoryDataset(TrajectoryDataset):
@@ -59,7 +59,12 @@ class PushMultiviewTrajectoryDataset(TrajectoryDataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
-    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
+    def get_frames(
+        self,
+        idx: int,
+        frames: Sequence[int],
+        stream_frames: Optional[StreamFrames] = None,
+    ) -> Sample:
         if self.prefetch:
             obs = self.obses[idx][frames]
         else:
@@ -69,7 +74,7 @@ class PushMultiviewTrajectoryDataset(TrajectoryDataset):
         obs = einops.rearrange(obs, "T V H W C -> T V C H W") / 255.0
         if self.view_idx is not None:
             obs = obs[:, self.view_idx : self.view_idx + 1]
-        act = self.actions[idx, frames]
+        act = self.actions[idx, frames_for("action", frames, stream_frames)]
         if self.onehot_goals:
             goal = self.goals[idx, frames]
         else:
