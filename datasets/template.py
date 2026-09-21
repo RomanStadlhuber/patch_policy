@@ -6,13 +6,13 @@ this interface alone.
 """
 
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 from torch.utils.data import TensorDataset
 
-from datasets.core import TrajectoryDataset
-from datasets.types import Sample
+from datasets.core import TrajectoryDataset, frames_for
+from datasets.types import Sample, StreamFrames
 
 
 class YourTrajectoryDataset(TensorDataset, TrajectoryDataset):
@@ -23,12 +23,19 @@ class YourTrajectoryDataset(TensorDataset, TrajectoryDataset):
         """Number of real (unpadded) timesteps in episode `idx`."""
         raise NotImplementedError
 
-    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
+    def get_frames(
+        self,
+        idx: int,
+        frames: Sequence[int],
+        stream_frames: Optional[StreamFrames] = None,
+    ) -> Sample:
         """Return the requested timesteps of episode `idx`.
 
         Every tensor in the returned Sample has time on axis 0, in the order
-        `frames` asks for. Do work proportional to len(frames), not to the
-        episode: this is called once per training sample.
+        `frames` asks for. A stream named in `stream_frames` reads its own list
+        instead: look it up with `frames_for(name, frames, stream_frames)`.
+        Do work proportional to the frames requested, not to the episode: this
+        is called once per training sample.
 
         `obs` is T V C H W, scaled to 0..1. `action` is T A. `goal` is
         whatever the policy conditions on, or a placeholder. `state` holds

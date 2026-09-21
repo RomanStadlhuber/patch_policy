@@ -4,10 +4,10 @@ import numpy as np
 from pathlib import Path
 from typing import Optional
 from torch.nn.utils.rnn import pad_sequence
-from datasets.core import TrajectoryDataset
+from datasets.core import TrajectoryDataset, frames_for
 from typing import Sequence
 
-from datasets.types import Sample
+from datasets.types import Sample, StreamFrames
 
 
 class LiberoGoalDataset(TrajectoryDataset):
@@ -95,7 +95,12 @@ class LiberoGoalDataset(TrajectoryDataset):
     def __len__(self):
         return len(self.demos)
 
-    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
+    def get_frames(
+        self,
+        idx: int,
+        frames: Sequence[int],
+        stream_frames: Optional[StreamFrames] = None,
+    ) -> Sample:
         demo = self.demos[idx]
         agentview_obs = torch.load(
             str(demo / "agentview_image.pth"),
@@ -110,7 +115,7 @@ class LiberoGoalDataset(TrajectoryDataset):
         if self.view_idx is not None:
             obs = obs[:, self.view_idx : self.view_idx + 1]
 
-        act = self.actions[idx][frames]
+        act = self.actions[idx][frames_for("action", frames, stream_frames)]
         sample: Sample = {"obs": obs, "action": act}
         if self.goals is not None:
             task_idx = idx // 50

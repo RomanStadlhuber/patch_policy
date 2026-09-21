@@ -3,10 +3,10 @@ import einops
 import pickle
 from pathlib import Path
 from typing import Optional
-from datasets.core import TrajectoryDataset
+from datasets.core import TrajectoryDataset, frames_for
 from typing import Sequence
 
-from datasets.types import Sample
+from datasets.types import Sample, StreamFrames
 
 
 class PushTDataset(TrajectoryDataset):
@@ -59,7 +59,12 @@ class PushTDataset(TrajectoryDataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
-    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
+    def get_frames(
+        self,
+        idx: int,
+        frames: Sequence[int],
+        stream_frames: Optional[StreamFrames] = None,
+    ) -> Sample:
         if self.prefetch:
             obs = self.obses[idx][frames]
         else:
@@ -67,7 +72,7 @@ class PushTDataset(TrajectoryDataset):
             obs = torch.load(str(vid_dir / f"episode_{idx:03d}.pth"))
             obs = obs[frames]
         obs = einops.rearrange(obs, "T H W C -> T 1 C H W") / 255.0  # T V C H W, 1 view
-        act = self.actions[idx, frames]
+        act = self.actions[idx, frames_for("action", frames, stream_frames)]
         dummy_goal = torch.ones([obs.shape[0], 1, 1, 1]) # dummy goal, T V P E
         return {"obs": obs, "action": act, "goal": dummy_goal}
 

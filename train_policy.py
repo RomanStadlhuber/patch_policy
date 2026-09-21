@@ -1,3 +1,4 @@
+import contextlib
 import einops
 import os
 import random
@@ -48,6 +49,18 @@ def seed_everything(random_seed: int):
     torch.manual_seed(random_seed)
     torch.cuda.manual_seed_all(random_seed)
     random.seed(random_seed)
+
+
+def nvtx_iter(iterable, name, nvtx_range):
+    """Yield from `iterable`, marking each wait for the next item as an NVTX range."""
+    iterator = iter(iterable)
+    while True:
+        with nvtx_range(name):
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+        yield item
 
 
 def save_snapshot(save_path, cbet_model, optimizer, accelerator, epoch,
@@ -546,6 +559,11 @@ def main(cfg):
 
     # per-step data/GPU timers sync the GPU twice per step, which slows training
     log_step_times = cfg.get("log_step_times", False)
+    # nsys capture: NVTX ranges name the step phases, and the training part of
+    # this run's second epoch is recorded, when the page cache already holds the
+    # embedding file. Launch under nsys with --capture-range=cudaProfilerApi.
+    nvtx_profile = cfg.get("nvtx_profile", False)
+    nvtx_range = torch.cuda.nvtx.range if nvtx_profile else contextlib.nullcontext
 
     for epoch in tqdm.trange(start_epoch, cfg.epochs):
         epoch_start_step = epoch * steps_per_epoch
@@ -675,11 +693,17 @@ def main(cfg):
         train_start = time.perf_counter()
         if log_step_times:
             data_start = time.perf_counter()
-        for i, data in enumerate(tqdm.tqdm(train_loader)):
+        profile_epoch = nvtx_profile and epoch == start_epoch + 1
+        if profile_epoch:
+            torch.cuda.synchronize()
+            torch.cuda.profiler.start()
+        batches = nvtx_iter(train_loader, "data_wait", nvtx_range) if nvtx_profile else train_loader
+        for i, data in enumerate(tqdm.tqdm(batches, total=len(train_loader))):
             optimizer.zero_grad()
-            obs = data["obs"].to(cfg.device, non_blocking=True)
-            act = data["action"].to(cfg.device, non_blocking=True)
-            goal = data["goal"].to(cfg.device, non_blocking=True)
+            with nvtx_range("h2d_copy"):
+                obs = data["obs"].to(cfg.device, non_blocking=True)
+                act = data["action"].to(cfg.device, non_blocking=True)
+                goal = data["goal"].to(cfg.device, non_blocking=True)
             if log_step_times:
                 torch.cuda.synchronize()
                 step_start = time.perf_counter()
@@ -689,21 +713,26 @@ def main(cfg):
                 obs = encoder(obs)  # N T V P E
                 if use_libero_goal:
                     goal = encoder(goal)  # N T V P E
-            # fp16 cache: upcast on the GPU, so the copy above moves half the bytes
-            obs, goal = obs.float(), goal.float()
-            obs = einops.rearrange(obs, "N T V P E -> N T (V P) E")
-            goal = einops.rearrange(goal, "N T V P E -> N T (V P) E")
-            predicted_act, loss, loss_dict = cbet_model(obs, goal, act)
-            train_loss += loss.item()
-            accelerator.backward(loss)
-            optimizer.step()
+            with nvtx_range("forward"):
+                # fp16 cache: upcast on the GPU, so the copy above moves half the bytes
+                obs, goal = obs.float(), goal.float()
+                obs = einops.rearrange(obs, "N T V P E -> N T (V P) E")
+                goal = einops.rearrange(goal, "N T V P E -> N T (V P) E")
+                predicted_act, loss, loss_dict = cbet_model(obs, goal, act)
+            with nvtx_range("loss_item"):
+                train_loss += loss.item()
+            with nvtx_range("backward"):
+                accelerator.backward(loss)
+            with nvtx_range("optimizer"):
+                optimizer.step()
 
             if use_diffusion:
-                if hasattr(cbet_model, "module"):
-                    cbet_model_raw = accelerator.unwrap_model(cbet_model)
-                    cbet_model_raw.ema_step()
-                else:
-                    cbet_model.ema_step()
+                with nvtx_range("ema"):
+                    if hasattr(cbet_model, "module"):
+                        cbet_model_raw = accelerator.unwrap_model(cbet_model)
+                        cbet_model_raw.ema_step()
+                    else:
+                        cbet_model.ema_step()
             if log_step_times:
                 torch.cuda.synchronize()
                 # step_s: forward, backward, optimizer and EMA on the GPU
@@ -713,13 +742,17 @@ def main(cfg):
                 train_sums[x] += y
             for x, y in step_times.items():
                 time_sums[x] += y
-            metrics_logger.log_scalars(
-                {**{"train/{}".format(x): y for x, y in loss_dict.items()}, **step_times},
-                step=epoch_start_step + i + 1,
-                epoch=epoch,
-            )
+            with nvtx_range("log"):
+                metrics_logger.log_scalars(
+                    {**{"train/{}".format(x): y for x, y in loss_dict.items()}, **step_times},
+                    step=epoch_start_step + i + 1,
+                    epoch=epoch,
+                )
             if log_step_times:
                 data_start = time.perf_counter()
+        if profile_epoch:
+            torch.cuda.synchronize()
+            torch.cuda.profiler.stop()
 
         if hasattr(cbet_model, "module"):
             if hasattr(accelerator.unwrap_model(cbet_model), "finish_epoch"):

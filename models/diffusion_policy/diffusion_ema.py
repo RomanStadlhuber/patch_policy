@@ -27,17 +27,26 @@ class EMAModel(nn.Module):
 
         self.register_buffer("decay", torch.tensor(0.0))
         self.register_buffer("optimization_step", torch.tensor(0, dtype=torch.int64))
+        self._step = None
 
     def get_decay(self, optimization_step):
         step = max(0, optimization_step - self.update_after_step - 1)
         value = 1 - (1 + step / self.inv_gamma) ** -self.power
         if step <= 0:
-            return torch.tensor(0.0)
-        return max(self.min_value, min(value, self.max_value))
+            return 0.0
+        return max(float(self.min_value), min(value, float(self.max_value)))
 
     @torch.no_grad()
     def step(self, new_model):
-        self.decay = self.get_decay(self.optimization_step).to(new_model.device)
+        # the step count and decay stay Python numbers: a GPU tensor as `alpha`
+        # syncs the GPU once per parameter, which idled it for half of each step
+        if self._step is None:
+            # read once, after a resume has loaded the buffer
+            self._step = int(self.optimization_step)
+        decay = self.get_decay(self._step)
+        self.decay.fill_(decay)
+
+        copy_dst, copy_src, avg_dst, avg_src = [], [], [], []
         for module, ema_module in zip(
             new_model.modules(), self.averaged_model.modules()
         ):
@@ -45,10 +54,16 @@ class EMAModel(nn.Module):
                 module.parameters(recurse=False), ema_module.parameters(recurse=False)
             ):
                 if isinstance(module, _BatchNorm) or not param.requires_grad:
-                    ema_param.copy_(param.to(dtype=ema_param.dtype).data)
+                    copy_dst.append(ema_param)
+                    copy_src.append(param.data.to(dtype=ema_param.dtype))
                 else:
-                    ema_param.mul_(self.decay)
-                    ema_param.add_(
-                        param.data.to(dtype=ema_param.dtype), alpha=1 - self.decay
-                    )
-        self.optimization_step += 1
+                    avg_dst.append(ema_param)
+                    avg_src.append(param.data.to(dtype=ema_param.dtype))
+        # one kernel launch per op for all parameters, instead of one per parameter
+        if copy_dst:
+            torch._foreach_copy_(copy_dst, copy_src)
+        if avg_dst:
+            torch._foreach_mul_(avg_dst, decay)
+            torch._foreach_add_(avg_dst, avg_src, alpha=1 - decay)
+        self._step += 1
+        self.optimization_step.fill_(self._step)

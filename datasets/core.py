@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, Subset
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from datasets.streams import StreamStore, StreamWriter, migrate_legacy_cache
-from datasets.types import EncoderRef, Sample
+from datasets.types import EncoderRef, Sample, StreamFrames
 
 
 # Taken from python 3.5 docs
@@ -45,12 +45,29 @@ class TrajectoryDataset(Dataset, abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
+    def get_frames(
+        self,
+        idx: int,
+        frames: Sequence[int],
+        stream_frames: Optional[StreamFrames] = None,
+    ) -> Sample:
         """
         Returns the frames from the idx-th trajectory at the specified frames.
         Used to speed up slicing.
+
+        Every stream reads `frames`, except the streams named in
+        `stream_frames`, which read their own list instead (see frames_for).
         """
         raise NotImplementedError
+
+
+def frames_for(
+    name: str, frames: Sequence[int], stream_frames: Optional[StreamFrames]
+) -> Sequence[int]:
+    """The frames stream `name` reads: its own list if it has one, else `frames`."""
+    if stream_frames is None:
+        return frames
+    return stream_frames.get(name, frames)
 
 
 class TrajectorySubset(TrajectoryDataset, Subset):
@@ -71,8 +88,13 @@ class TrajectorySubset(TrajectoryDataset, Subset):
     def get_all_actions(self) -> torch.Tensor:
         return self.dataset.get_all_actions()
 
-    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
-        return self.dataset.get_frames(self.indices[idx], frames)
+    def get_frames(
+        self,
+        idx: int,
+        frames: Sequence[int],
+        stream_frames: Optional[StreamFrames] = None,
+    ) -> Sample:
+        return self.dataset.get_frames(self.indices[idx], frames, stream_frames)
 
 
 class TrajectorySlicerDataset(Dataset):
@@ -82,7 +104,8 @@ class TrajectorySlicerDataset(Dataset):
 
     dataset: a trajectory dataset that satisfies:
         dataset.get_seq_length(i) returns the length of sequence i
-        dataset.get_frames(i, frames) -> Sample, each stream sliced to frames
+        dataset.get_frames(i, frames, stream_frames) -> Sample, each stream
+            sliced to frames, or to its own list in stream_frames
         observations: Tensor[T, ...]
         actions: Tensor[T, ...]
     window: int
@@ -174,22 +197,27 @@ class TrajectorySlicerDataset(Dataset):
         return len(self.slices)
 
     def __getitem__(self, idx: int) -> Sample:
-        i, start, end = self.slices[idx]
-        # fetch only the frames this slice needs (the union of the obs window and
-        # the action window, which can extend past it) instead of the whole
-        # episode: dataset[i] reprocesses every frame of the episode, while
+        idx_episode, idx_start, idx_end = self.slices[idx]
+        # fetch only the frames this slice needs instead of the whole episode:
+        # dataset[idx_episode] reprocesses every frame of the episode, while
         # get_frames does work proportional to what's requested
-        T = self.dataset.get_seq_length(i)
-        # -1 due to overlap for 1 step between obs and act
-        frame_end = min(end - 1 + self.action_window, T)
-        sample = self.dataset.get_frames(i, range(start, frame_end))
-        # "action" spans the action window; every other stream follows the
-        # observation window, which is the shorter of the two
+        T = self.dataset.get_seq_length(idx_episode)
+        # every stream but "action" reads the observation window, which ends at
+        # `idx_end`; "action" also spans the chunk after it (-1 due to overlap
+        # for 1 step between obs and act). Both start at `idx_start`, so frame k
+        # is the same timestep in every stream.
+        action_end = min(idx_end - 1 + self.action_window, T)
+        sample = self.dataset.get_frames(
+            idx_episode,
+            range(idx_start, idx_end),
+            stream_frames={"action": range(idx_start, action_end)},
+        )
         act = sample["action"]
-        rel_end = end - start
 
         values: Sample = {}
-        if end - start < self.window:
+        # the first slices of an episode are shorter than the window: repeat
+        # their first frame to fill it
+        if idx_end - idx_start < self.window:
             act = utils.inference.repeat_start_to_length(
                 act, self.window + self.action_window - 1, dim=0
             )
@@ -197,13 +225,13 @@ class TrajectorySlicerDataset(Dataset):
                 if name == "action":
                     continue
                 values[name] = utils.inference.repeat_start_to_length(
-                    value[:rel_end], self.window, dim=0
+                    value, self.window, dim=0
                 )
         else:
             for name, value in sample.items():
                 if name == "action":
                     continue
-                values[name] = value[:rel_end]
+                values[name] = value
 
         if self.vqbet_get_future_action_chunk:
             expected_len = self.action_window
@@ -255,8 +283,16 @@ class TrajectoryEmbeddingDataset(TrajectoryDataset):
     def get_all_actions(self) -> torch.Tensor:
         return torch.cat([episode["action"] for episode in self.data], dim=0)
 
-    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
-        return {name: value[frames] for name, value in self.data[idx].items()}
+    def get_frames(
+        self,
+        idx: int,
+        frames: Sequence[int],
+        stream_frames: Optional[StreamFrames] = None,
+    ) -> Sample:
+        return {
+            name: value[frames_for(name, frames, stream_frames)]
+            for name, value in self.data[idx].items()
+        }
 
     def __getitem__(self, idx: int) -> Sample:
         # the stored tensors, not get_frames(range(...)): a range index copies the episode
@@ -364,13 +400,22 @@ class FileEmbeddingDataset(TrajectoryDataset):
     def get_all_actions(self) -> torch.Tensor:
         return self.store.all_rows("action")
 
-    def get_frames(self, idx: int, frames: Sequence[int]) -> Sample:
+    def get_frames(
+        self,
+        idx: int,
+        frames: Sequence[int],
+        stream_frames: Optional[StreamFrames] = None,
+    ) -> Sample:
         length = self.seq_lengths[idx]
-        local = np.asarray(frames, dtype=np.int64)
-        # negative indices address the episode, not the row before it
-        local = np.where(local < 0, local + length, local)
+
+        def local(stream_list: Sequence[int]) -> np.ndarray:
+            rows = np.asarray(stream_list, dtype=np.int64)
+            # negative indices address the episode, not the row before it
+            return np.where(rows < 0, rows + length, rows)
+
         return {
-            name: self.store.read(name, idx, local) for name in self.store.specs
+            name: self.store.read(name, idx, local(frames_for(name, frames, stream_frames)))
+            for name in self.store.specs
         }
 
     def __getitem__(self, idx: int) -> Sample:

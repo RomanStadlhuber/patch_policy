@@ -37,6 +37,8 @@ pred_horizon: ${eval:'${action_window_size} + ${window_size} - 1'}
 n_action_steps: ${action_window_size} # Action steps to roll out
 
 precompute_embeddings: False
+# name step phases with NVTX and record epoch 2 under nsys --capture-range=cudaProfilerApi
+nvtx_profile: false
 
 goal_dim: 0
 wandb:
