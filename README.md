@@ -19,7 +19,7 @@ This repo contains code for training and reproducing sim environment experiments
 
 ## Setup
 
-Dependencies are managed with [uv](https://docs.astral.sh/uv/). It installs Python 3.9 and
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). It installs Python 3.12 and
 everything else, including the CUDA build of PyTorch:
 
 ```
