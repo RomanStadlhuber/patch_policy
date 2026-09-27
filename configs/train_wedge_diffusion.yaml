@@ -1,0 +1,116 @@
+# Wedge grasp diffusion policy: heel-frame chunk deltas from supermanipulation's exporter,
+# rolled out in its Drake WedgeGraspEnv. Contract: supermanipulation
+# .claude/plans/policy-training/eval-sim-options.md, "Validation interfaces".
+defaults:
+  - env_vars: env_vars
+  - encoder: dino_patch
+  - _self_
+  - cluster: local
+
+hydra:
+  run:
+    dir: ${env_vars.save_path}/outputs/${env.gym.id}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: True
+  sweep:
+    dir: ${env_vars.save_path}/outputs/${env.gym.id}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+seed: 42
+# observe t-1 and t; the export's chunks are built for this window, change it only with a re-export
+window_size: 2
+goal_window_size: 2
+eval_window_size: 2
+
+num_workers: 8
+
+batch_size: 64
+epochs: 300
+eval_freq: 10
+eval_on_env_freq: 10
+num_env_evals: 10
+num_envs: 10
+num_final_evals: 10
+
+# denoising steps when sampling actions with DDIM; training always uses num_train_timesteps.
+rollout_inference_steps: 100  # rollouts during training
+final_inference_steps: 100  # final eval after training
+ddim_eta: 0.0  # 0.0 samples deterministically, 1.0 adds as much noise per step as DDPM
+# pred_horizon 16 (t-1 .. t+14) must match the export's chunk length
+action_window_size: 15
+
+pred_horizon: ${eval:'${action_window_size} + ${window_size} - 1'}
+n_action_steps: 8 # execute t .. t+7 of each chunk
+
+precompute_embeddings: False
+# name step phases with NVTX and record epoch 2 under nsys --capture-range=cudaProfilerApi
+nvtx_profile: false
+
+goal_dim: 0
+wandb:
+  project: patch_policy
+  entity: ${env_vars.wandb_entity}
+train_fraction: 0.9
+
+device: cuda
+optim:
+  lr: 1e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+
+# LinearNormalizer.fit kwargs: limits per (chunk position, dim), the data range mapped to
+# +/-0.5, so later datasets can reach twice these deltas before the sampler clips at +/-1
+action_normalizer:
+  last_n_dims: 2
+  output_min: -0.5
+  output_max: 0.5
+
+env:
+  gym:
+    _target_: supermanipulation.wedge.env.WedgeGraspEnv
+    id: 'wedge'
+    # absolute: Hydra's job.chdir breaks a relative path
+    eval_set: /home/roman/git/me/supermanipulation/data/datasets/policy_eval/eval_s1_n10/eval_set.yaml
+    # train_policy.py adds worker_index per env worker
+    num_workers: ${num_envs}
+  act_dim: 10
+  goal_dim: ${goal_dim}
+  views: 1
+
+dataset:
+  _target_: datasets.wedge.WedgeDataset
+  data_directory: ${env_vars.datasets.wedge}
+  prefetch: false
+
+data:
+  window_size: ${window_size}
+  action_window_size: ${action_window_size}
+  vqbet_get_future_action_chunk: false
+  goal_conditional: future
+  future_seq_len: ${goal_window_size}
+  min_future_sep: ${action_window_size}
+  # actions.pth holds one (16, 10) chunk per frame; the slicer picks the window's last row
+  chunked_actions: true
+
+save_ckpt: true
+save_path: "${env_vars.save_path}/outputs/${env.gym.id}/${now:%Y-%m-%d}/${now:%H-%M-%S}"
+load_path: null
+
+model:
+  _target_: models.diffusion_policy.diffusion_policy.DiffusionPolicy
+  obs_dim: ${encoder.output_dim}
+  act_dim: ${env.act_dim}
+  goal_dim: ${env.goal_dim}
+  views: ${env.views}
+  obs_horizon: ${window_size}
+  pred_horizon: ${pred_horizon}
+  action_horizon: ${n_action_steps}
+  visual_input: true
+  data_act_scale: 1
+  lr: ${optim.lr}
+  weight_decay: ${optim.weight_decay}
+  use_transform: null
+  n_patches: ${encoder.n_patches} # number of patches along one dimension (e.g. 16 for 16x16 patches)
+  num_train_timesteps: 100
+  num_inference_steps: ${rollout_inference_steps}
+  ddim_eta: ${ddim_eta}
+  timestep_spacing: trailing
