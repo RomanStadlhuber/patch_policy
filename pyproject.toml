@@ -245,3 +245,7 @@ explicit = true
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 supermanipulation = { path = "../supermanipulation", editable = true }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

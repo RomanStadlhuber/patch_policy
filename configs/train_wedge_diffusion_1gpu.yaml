@@ -1,0 +1,23 @@
+# Wedge diffusion policy, single-GPU embedding-precompute run: the validation run's values
+# (40 demos, 1-3 epochs, 10 rollouts), see supermanipulation's eval-sim-options.md "Validation run".
+defaults:
+  - train_wedge_diffusion
+  - override /encoder: dino_patch
+  - override /cluster: local
+  - _self_
+
+batch_size: 64
+epochs: 3
+eval_freq: 1
+# env eval after epoch index 2 ((epoch + 1) % freq == 0), then the final eval
+eval_on_env_freq: 3
+num_envs: 10
+num_env_evals: 10
+num_final_evals: 10
+precompute_embeddings: true
+num_workers: 2
+
+# cached embeddings in fp16: halves the host-RAM cache the precompute builds
+embedding_fp16: true
+embedding_cache: file
+train_fraction: 0.9

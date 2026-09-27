@@ -9,3 +9,4 @@ datasets:
     libero: ${env_vars.dataset_root}/libero_dataset
     block_push: ${env_vars.dataset_root}/block_push_dataset
     cube: ${env_vars.dataset_root}/cube_dataset
+    wedge: ${env_vars.dataset_root}/wedge_demos_100_v2_stopped40
