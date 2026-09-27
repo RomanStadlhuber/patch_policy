@@ -28,6 +28,8 @@ uv sync --all-extras        # all four environments
 ```
 
 Extras are per environment: `--extra blockpush`, `--extra libero`, `--extra cube`.
+The wedge grasp env (Drake) needs a `supermanipulation` checkout next to this one
+(`../supermanipulation`); uv installs it as an editable dependency.
 Run commands through `uv run` (e.g. `uv run python train_policy.py ...`), or activate the
 environment with `source .venv/bin/activate`.
 
