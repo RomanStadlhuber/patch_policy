@@ -130,20 +130,30 @@ def export_fingerprint(data_directory: Path) -> List[str]:
 
 
 def rollout_metrics(
-    env_id: str, max_coverage: List[float], final_coverage: List[float]
+    env_id: str,
+    max_coverage: List[float],
+    final_coverage: List[float],
+    end_phases: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Per-env rollout summary from `eval_on_env`'s two per-episode lists, or None.
+    """Per-env rollout summary from `eval_on_env`'s per-episode lists, or None.
 
-    For the wedge env, `max_coverage` holds success (0 or 1) and `final_coverage`
-    `p_score` per episode.
+    For the wedge env, `max_coverage` holds success (0 or 1), `final_coverage`
+    `p_score` and `end_phases` the phase each episode ended in; every end phase
+    gets the fraction of episodes that ended in it, zero included.
     """
     if env_id == "wedge":
-        return {
+        from supermanipulation.wedge.env import ENDED
+
+        phases = end_phases or []
+        metrics = {
             "p_score mean": sum(final_coverage) / len(final_coverage),
             "p_score max": max(final_coverage),
             "p_score min": min(final_coverage),
             "success rate": sum(max_coverage) / len(max_coverage),
         }
+        for phase in ENDED:
+            metrics[f"end {phase.lower()}"] = phases.count(phase) / max(len(phases), 1)
+        return metrics
     if env_id not in ["pusht", "blockpush", "cube"]:
         return None
     metric_final = "final coverage" if env_id == "pusht" else "entered"
@@ -499,6 +509,7 @@ def main(cfg):
         completion_id_list = []
         avg_max_coverage = []
         avg_final_coverage = []
+        end_phases: List[str] = []  # wedge only: the phase each episode ended in
         env.seed([cfg.seed + i for i in range(cfg.num_envs)])
         num_batches = num_evals // cfg.num_envs
         for goal_idx in range(num_batches):
@@ -586,6 +597,7 @@ def main(cfg):
                 # every env is done here and keeps returning its final info
                 avg_max_coverage += [float(info[i]["success"]) for i in range(len(info))]
                 avg_final_coverage += [float(info[i]["p_score"]) for i in range(len(info))]
+                end_phases += [str(info[i]["phase"]) for i in range(len(info))]
             completion_id_list += [info[i]["all_completions_ids"] for i in range(len(info))]
             videorecorder.save("eval_{}_{}.mp4".format(epoch, goal_idx))
         return (
@@ -593,6 +605,7 @@ def main(cfg):
             completion_id_list,
             avg_max_coverage,
             avg_final_coverage,
+            end_phases,
         )
 
     # Restore bookkeeping from snapshot when resuming, else start fresh.
@@ -662,7 +675,7 @@ def main(cfg):
         if (epoch + 1) % cfg.eval_on_env_freq == 0:
             set_inference_steps(cfg.get("rollout_inference_steps", 100))
             rollout_start = time.perf_counter()
-            avg_reward, completion_id_list, max_coverage, final_coverage = eval_on_env(
+            avg_reward, completion_id_list, max_coverage, final_coverage, end_phases = eval_on_env(
                 cfg,
                 videorecorder=video,
                 epoch=epoch,
@@ -677,7 +690,7 @@ def main(cfg):
             metrics_logger.log_scalars(
                 {"rollout/avg_reward": avg_reward}, step=epoch_start_step, epoch=epoch
             )
-            metrics = rollout_metrics(cfg.env.gym.id, max_coverage, final_coverage)
+            metrics = rollout_metrics(cfg.env.gym.id, max_coverage, final_coverage, end_phases)
             if metrics is not None:
                 print("final coverage mean: ", sum(final_coverage) / len(final_coverage))
                 metrics_logger.log_scalars(
@@ -872,7 +885,7 @@ def main(cfg):
 
     set_inference_steps(cfg.get("final_inference_steps", 100))
     final_eval_start = time.perf_counter()
-    avg_reward, completion_id_list, max_coverage, final_coverage = eval_on_env(
+    avg_reward, completion_id_list, max_coverage, final_coverage, end_phases = eval_on_env(
         cfg,
         num_evals=cfg.num_final_evals,
         videorecorder=video,
@@ -897,7 +910,7 @@ def main(cfg):
     metrics_logger.log_scalars(
         {"rollout/avg_reward": avg_reward}, step=cfg.epochs * steps_per_epoch, epoch=cfg.epochs
     )
-    metrics = rollout_metrics(cfg.env.gym.id, max_coverage, final_coverage)
+    metrics = rollout_metrics(cfg.env.gym.id, max_coverage, final_coverage, end_phases)
     if metrics is not None:
         metrics_logger.log_scalars(
             rollout_scalars(metrics), step=cfg.epochs * steps_per_epoch, epoch=cfg.epochs
