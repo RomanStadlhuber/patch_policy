@@ -69,7 +69,7 @@ env:
     _target_: supermanipulation.wedge.env.WedgeGraspEnv
     id: 'wedge'
     # absolute: Hydra's job.chdir breaks a relative path
-    eval_set: /home/roman/git/me/supermanipulation/data/datasets/policy_eval/eval_s1_n10/eval_set.yaml
+    eval_set: /home/roman/git/me/supermanipulation/data/datasets/policy_eval/eval_n107/eval_set.yaml
     # train_policy.py adds worker_index per env worker
     num_workers: ${num_envs}
   act_dim: 10
