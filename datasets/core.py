@@ -118,6 +118,11 @@ class TrajectorySlicerDataset(Dataset):
     transform: function (values) -> values
     pad_seq_length: bool = True
         pad actions at the end to ensure a fixed length instead of dropping short slices
+    chunked_actions: bool = False
+        the dataset stores one whole action chunk per frame (e.g. `(T, H, A)`), so
+        the sample's action is the single row of the window's last frame, returned
+        as is: no slicing, start repeat or end padding. The other streams are
+        handled as usual.
 
     Goal conditioning is not handled here: any goal tensor is carried through as part
     of `*others` by the underlying dataset. The remaining arguments
@@ -139,6 +144,7 @@ class TrajectorySlicerDataset(Dataset):
         transform: Optional[Callable] = None,
         use_libero_goal: bool = False,
         pad_seq_length: bool = True,  # pad actions at end to ensure fixed length
+        chunked_actions: bool = False,
     ):
         if future_conditional:
             assert future_seq_len is not None, "must specify a future_seq_len"
@@ -154,6 +160,7 @@ class TrajectorySlicerDataset(Dataset):
         self.slices = []
         self.use_libero_goal = use_libero_goal
         self.pad_seq_length = pad_seq_length
+        self.chunked_actions = chunked_actions
 
         min_seq_length = np.inf
         min_window_required = window + action_window - 1
@@ -165,7 +172,8 @@ class TrajectorySlicerDataset(Dataset):
                 (i, 0, end + 1) for end in range(window - 1)
             ]  # slice indices follow convention [start, end)
 
-            if self.pad_seq_length:
+            # chunked actions carry their own end padding, so no slice is dropped
+            if self.pad_seq_length or self.chunked_actions:
                 if T - self.window >= 0:
                     self.slices += [
                         (i, start, start + self.window)
@@ -182,7 +190,7 @@ class TrajectorySlicerDataset(Dataset):
                         for start in range(T - min_window_required + 1)
                     ]
 
-        if (not self.pad_seq_length) and (min_seq_length < min_window_required):
+        if (not (self.pad_seq_length or self.chunked_actions)) and (min_seq_length < min_window_required):
             print(
                 f"Ignored short sequences. To include all, set window <= {min_seq_length}."
             )
@@ -206,11 +214,16 @@ class TrajectorySlicerDataset(Dataset):
         # `idx_end`; "action" also spans the chunk after it (-1 due to overlap
         # for 1 step between obs and act). Both start at `idx_start`, so frame k
         # is the same timestep in every stream.
-        action_end = min(idx_end - 1 + self.action_window, T)
+        if self.chunked_actions:
+            # row idx_end - 1 already holds the whole chunk for this window
+            action_frames = [idx_end - 1]
+        else:
+            action_end = min(idx_end - 1 + self.action_window, T)
+            action_frames = range(idx_start, action_end)
         sample = self.dataset.get_frames(
             idx_episode,
             range(idx_start, idx_end),
-            stream_frames={"action": range(idx_start, action_end)},
+            stream_frames={"action": action_frames},
         )
         act = sample["action"]
 
@@ -218,9 +231,10 @@ class TrajectorySlicerDataset(Dataset):
         # the first slices of an episode are shorter than the window: repeat
         # their first frame to fill it
         if idx_end - idx_start < self.window:
-            act = utils.inference.repeat_start_to_length(
-                act, self.window + self.action_window - 1, dim=0
-            )
+            if not self.chunked_actions:
+                act = utils.inference.repeat_start_to_length(
+                    act, self.window + self.action_window - 1, dim=0
+                )
             for name, value in sample.items():
                 if name == "action":
                     continue
@@ -232,6 +246,12 @@ class TrajectorySlicerDataset(Dataset):
                 if name == "action":
                     continue
                 values[name] = value
+
+        if self.chunked_actions:
+            values["action"] = act[0]
+            if self.transform is not None:
+                values = self.transform(values)
+            return values
 
         if self.vqbet_get_future_action_chunk:
             expected_len = self.action_window

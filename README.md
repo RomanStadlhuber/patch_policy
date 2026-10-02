@@ -4,11 +4,13 @@
 
 [Gaoyue Zhou](https://gaoyuezhou.github.io/), [Zichen Jeff Cui](https://jeffcui.com/), [Ada Langford](https://www.linkedin.com/in/ada-langford-231883332/), [Bowen Tan](https://bowen-tan.com/), [Yann LeCun](http://yann.lecun.com/) and [Lerrel Pinto](https://www.lerrelpinto.com/), New York University, Meta AI, AMI Labs
 
-https://github.com/user-attachments/assets/3de8fc0d-9411-41f3-84c3-9e79b899e144
 
 ![Method overview](assets/method.png)
 
 This repo contains code for training and reproducing sim environment experiments across four simulation environments: Push-T, Block Pushing, LIBERO Goal, and Cube.
+
+> **Fork Note:** I have extended this repository to load and interact with the environments from a custom simulator.
+> This simulator will not be provided.
 
 ## Getting Started
 
@@ -19,7 +21,7 @@ This repo contains code for training and reproducing sim environment experiments
 
 ## Setup
 
-Dependencies are managed with [uv](https://docs.astral.sh/uv/). It installs Python 3.9 and
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). It installs Python 3.12 and
 everything else, including the CUDA build of PyTorch:
 
 ```
@@ -28,10 +30,12 @@ uv sync --all-extras        # all four environments
 ```
 
 Extras are per environment: `--extra blockpush`, `--extra libero`, `--extra cube`.
+
 Run commands through `uv run` (e.g. `uv run python train_policy.py ...`), or activate the
 environment with `source .venv/bin/activate`.
 
-Tested on Ubuntu 22.04 with CUDA 12.8. To log training runs, log in to Weights & Biases with `wandb login` (or set `export WANDB_MODE=disabled` to turn logging off). In `./configs/env_vars/env_vars.yaml`, set `wandb_entity` to your wandb username.
+Tested on Ubuntu 22.04 with CUDA 12.8. Training runs log to TensorBoard in each run directory; Weights & Biases logging is off by default.
+To turn it on, log in with `wandb login`, set `wandb_entity` to your wandb username in `./configs/env_vars/env_vars.yaml`, and run with `WANDB_MODE=online`.
 
 ## Datasets
 
@@ -91,13 +95,6 @@ patch_policy_datasets/
 
 Policy training and online evaluation both run through `train_policy.py`, driven by the configs in `configs/`. A run trains the policy on top of a **frozen visual encoder** and periodically rolls it out in the simulator.
 
-```
-python train_policy.py --config-name train_pusht        # Push-T
-python train_policy.py --config-name train_blockpush    # Block Pushing
-python train_policy.py --config-name train_cube         # Cube
-MUJOCO_GL=egl python train_policy.py --config-name train_libero_goal   # LIBERO Goal
-```
-
 - **Diffusion policy** variants are available for every environment — append `_diffusion` to the config name (e.g. `train_pusht_diffusion`). The default configs use a VQ-BeT policy head.
 - Checkpoints are written under `save_path`.
 
@@ -105,6 +102,12 @@ MUJOCO_GL=egl python train_policy.py --config-name train_libero_goal   # LIBERO 
 
 The config names above assume a node of 8 GPUs. We also provide `_1gpu` variants of
 every config, tuned to fit within 32 GB of VRAM:
+
+> **Fork Note:** The code in this repository, specifically the dataloader logic,
+> was optimized for training and inference on a single 3090 RTX.
+>
+> Specifically, this repository uses Diffusion-Policy as its main driver, though
+> VQ-BeT does work too.
 
 ```
 python train_policy.py --config-name train_pusht_1gpu

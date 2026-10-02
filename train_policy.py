@@ -3,13 +3,17 @@ import einops
 import os
 import random
 import time
+import warnings
 from collections import defaultdict, deque
+from functools import partial
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import hydra
 import numpy as np
 import torch
 import tqdm
+from diffusers.optimization import get_scheduler
 from omegaconf import OmegaConf
 
 import wandb
@@ -38,6 +42,8 @@ from resources_test import format_params, count_parameters
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 os.environ["WANDB_START_METHOD"] = "thread"
+# metrics go to TensorBoard; WANDB_MODE=online turns wandb logging back on
+os.environ.setdefault("WANDB_MODE", "disabled")
 logger = logging.getLogger(__name__)
 
 if "MUJOCO_GL" not in os.environ:
@@ -64,12 +70,14 @@ def nvtx_iter(iterable, name, nvtx_range):
 
 
 def save_snapshot(save_path, cbet_model, optimizer, accelerator, epoch,
-                  wandb_run_id, metrics_history, reward_history, best_eval_metric):
+                  wandb_run_id, metrics_history, reward_history, best_eval_metric,
+                  lr_scheduler=None):
     # Snapshot the full training state so a preempted/requeued job can resume.
     cbet_model_raw = accelerator.unwrap_model(cbet_model)
     snapshot = {
         "model": cbet_model_raw,
         "optimizer_state_dict": optimizer.state_dict(),
+        "lr_scheduler_state_dict": lr_scheduler.state_dict() if lr_scheduler is not None else None,
         "epoch": epoch,
         "wandb_run_id": wandb_run_id,
         "metrics_history": metrics_history,
@@ -107,6 +115,63 @@ def load_snapshot(snapshot_path, cbet_model, optimizer, accelerator):
         cbet_model_raw.vqvae_is_fit = saved_model.vqvae_is_fit
     optimizer.load_state_dict(snapshot["optimizer_state_dict"])
     return snapshot
+
+
+def export_fingerprint(data_directory: Path) -> List[str]:
+    """Key parts that change when an exported dataset is rewritten in place.
+
+    The embedding cache also stores the actions, so a re-export into the same
+    directory must not reuse it. Empty for datasets without `export.yaml`, which
+    keeps their existing cache keys.
+    """
+    export = data_directory / "export.yaml"
+    if not export.is_file():
+        return []
+    actions = data_directory / "actions.pth"
+    stat = actions.stat() if actions.is_file() else None
+    return [
+        export.read_text(),
+        f"{stat.st_size}:{stat.st_mtime_ns}" if stat is not None else "",
+    ]
+
+
+def rollout_metrics(
+    env_id: str,
+    max_coverage: List[float],
+    final_coverage: List[float],
+    end_phases: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Per-env rollout summary from `eval_on_env`'s per-episode lists, or None.
+
+    For the wedge env, `max_coverage` holds success (0 or 1), `final_coverage`
+    `p_score` and `end_phases` the phase each episode ended in; every end phase
+    gets the fraction of episodes that ended in it, zero included.
+    """
+    if env_id == "wedge":
+        from supermanipulation.wedge.env import ENDED
+
+        phases = end_phases or []
+        metrics = {
+            "p_score mean": sum(final_coverage) / len(final_coverage),
+            "p_score max": max(final_coverage),
+            "p_score min": min(final_coverage),
+            "success rate": sum(max_coverage) / len(max_coverage),
+        }
+        for phase in ENDED:
+            metrics[f"end {phase.lower()}"] = phases.count(phase) / max(len(phases), 1)
+        return metrics
+    if env_id not in ["pusht", "blockpush", "cube"]:
+        return None
+    metric_final = "final coverage" if env_id == "pusht" else "entered"
+    metric_max = "max coverage" if env_id == "pusht" else "moved"
+    return {
+        f"{metric_final} mean": sum(final_coverage) / len(final_coverage),
+        f"{metric_final} max": max(final_coverage),
+        f"{metric_final} min": min(final_coverage),
+        f"{metric_max} mean": sum(max_coverage) / len(max_coverage),
+        f"{metric_max} max": max(max_coverage),
+        f"{metric_max} min": min(max_coverage),
+    }
 
 
 @hydra.main(config_path="configs", version_base="1.2")
@@ -227,7 +292,11 @@ def main(cfg):
         else:
             actions = dataset.get_all_actions()
             action_normalizer = LinearNormalizer()
-            action_normalizer.fit(actions)
+            # e.g. wedge: per (chunk position, dim) limits with 2x headroom
+            normalizer_kwargs = OmegaConf.to_container(
+                cfg.get("action_normalizer", None) or OmegaConf.create({}), resolve=True
+            )
+            action_normalizer.fit(actions, **normalizer_kwargs)
             cbet_model.set_normalizer(action_normalizer)
 
     optimizer = cbet_model.configure_optimizers(
@@ -245,6 +314,7 @@ def main(cfg):
     resume_metrics_history = None
     resume_reward_history = None
     resume_best_eval_metric = None
+    resume_lr_scheduler_state = None
     if snapshot_path.exists():
         logger.info(f"Resuming from snapshot: {snapshot_path}")
         snapshot = load_snapshot(snapshot_path, cbet_model, optimizer, accelerator)
@@ -252,6 +322,7 @@ def main(cfg):
         resume_metrics_history = snapshot["metrics_history"]
         resume_reward_history = snapshot["reward_history"]
         resume_best_eval_metric = snapshot.get("best_eval_metric", float("-inf"))
+        resume_lr_scheduler_state = snapshot.get("lr_scheduler_state_dict")
         logger.info(f"Resumed from epoch {snapshot['epoch']}, will start at epoch {start_epoch}")
 
     # No need to create directory or wait - Hydra already set up the working directory
@@ -304,13 +375,15 @@ def main(cfg):
             Path(cfg.env_vars.dataset_root) / "embedding_cache"
         )
         np_dtype = np.float16 if embedding_fp16 else np.float32
-        cache_key = embedding_cache_key(
+        cache_key_parts = [
             OmegaConf.to_yaml(cfg.encoder, resolve=True),
             cfg.dataset.data_directory,
             cfg.dataset.get("subset_fraction", None),
             np_dtype().dtype.name,
             use_libero_goal,
-        )
+        ]
+        cache_key_parts += export_fingerprint(Path(cfg.dataset.data_directory))
+        cache_key = embedding_cache_key(*cache_key_parts)
         # recorded in the manifest so a cache directory says what made it
         encoder_ref = {
             "hub_repo": cfg.encoder.get("hub_repo", ""),
@@ -354,6 +427,7 @@ def main(cfg):
         "min_future_sep": cfg.data.action_window_size,
         "future_seq_len": cfg.data.future_seq_len,
         "use_libero_goal": use_libero_goal,
+        "chunked_actions": cfg.data.get("chunked_actions", False),
     }
 
     train_data = TrajectorySlicerDataset(train_data, **traj_slicer_kwargs)
@@ -374,8 +448,21 @@ def main(cfg):
     train_loader = accelerator.prepare(train_loader)
     test_loader = accelerator.prepare(test_loader)
 
-    env_fn = lambda: hydra.utils.instantiate(cfg.env.gym)
-    env = SubprocVectorEnv([env_fn for _ in range(cfg.num_envs)])
+    is_wedge = cfg.env.gym.id == "wedge"
+    if is_wedge:
+        if not use_diffusion:
+            raise NotImplementedError("wedge chunk decoding exists for diffusion only")
+        # resolved to a plain dict, so no interpolation needs the root config in the worker;
+        # partial binds i per worker, where a lambda would see the last i
+        gym_cfg = OmegaConf.to_container(cfg.env.gym, resolve=True)
+        env_fns = [
+            partial(hydra.utils.instantiate, gym_cfg, worker_index=i)
+            for i in range(cfg.num_envs)
+        ]
+    else:
+        env_fn = lambda: hydra.utils.instantiate(cfg.env.gym)
+        env_fns = [env_fn for _ in range(cfg.num_envs)]
+    env = SubprocVectorEnv(env_fns)
     if "use_libero_goal" in cfg.data:
         with torch.no_grad():
             # calculate goal embeddings for each task
@@ -416,11 +503,21 @@ def main(cfg):
             return einops.rearrange(enc(obs), "N V P E -> N (V P) E")
         assert num_evals % cfg.num_envs == 0, "num_evals must be multiple of num_envs"
 
+        if is_wedge:
+            # imported here so the other envs never import pydrake
+            from supermanipulation.wedge.actions import decode_chunk
+            from supermanipulation.wedge.env import stack_frames, stack_state
+
+        def frames_of(raw_obs):
+            """The image batch N V C H W; the wedge env returns an object array of WedgeObs."""
+            return stack_frames(raw_obs) if is_wedge else raw_obs
+
         avg_reward = 0
         action_list = []
         completion_id_list = []
         avg_max_coverage = []
         avg_final_coverage = []
+        end_phases: List[str] = []  # wedge only: the phase each episode ended in
         env.seed([cfg.seed + i for i in range(cfg.num_envs)])
         num_batches = num_evals // cfg.num_envs
         for goal_idx in range(num_batches):
@@ -432,7 +529,8 @@ def main(cfg):
                 # PushTEnv.reset rebuilds its RNG from the seed, so each batch needs its own seeds
                 base_seed = cfg.seed + goal_idx * cfg.num_envs
                 env.seed([base_seed + j for j in range(cfg.num_envs)])
-            this_obs = env.reset(goal_idx=goal_idx)  # N V C H W
+            raw_obs = env.reset(goal_idx=goal_idx)
+            this_obs = frames_of(raw_obs)  # N V C H W
             print(f"Eval on goal {goal_idx}/{num_batches}, {cfg.num_envs} episodes")
             assert (
                 this_obs.min() >= 0 and this_obs.max() <= 1
@@ -451,10 +549,17 @@ def main(cfg):
                 # action was T, Chunk, Action_dim for single env
                 # now it's N, T, C, A for vector env
                 if use_diffusion:
-                    for t in range(action.shape[1]):
-                        exec_action = action[:, t].cpu().detach().numpy()
-                        this_obs, reward, done, info = env.step(exec_action)
-                        obs_stack.append(embed(encoder, this_obs))
+                    # N, n_action_steps, A: chunk positions obs_horizon - 1 onward,
+                    # i.e. the actions for t .. t + n_action_steps - 1
+                    exec_actions = action.cpu().detach().numpy()
+                    if is_wedge:
+                        # heel-frame deltas from the measured state at t (the last
+                        # frame the model saw) to absolute targets in T, once per chunk
+                        exec_actions = decode_chunk(exec_actions, *stack_state(raw_obs))
+                    for t in range(exec_actions.shape[1]):
+                        exec_action = exec_actions[:, t]
+                        raw_obs, reward, done, info = env.step(exec_action)
+                        obs_stack.append(embed(encoder, frames_of(raw_obs)))
                         if videorecorder.enabled:
                             videorecorder.record(info[0]["image"])
                         total_reward += reward.sum()
@@ -496,6 +601,11 @@ def main(cfg):
             elif cfg.env.gym.id in ["blockpush", "cube"]:
                 avg_max_coverage += [info[i]["moved"] for i in range(len(info))]
                 avg_final_coverage += [info[i]["entered"] for i in range(len(info))]
+            elif is_wedge:
+                # every env is done here and keeps returning its final info
+                avg_max_coverage += [float(info[i]["success"]) for i in range(len(info))]
+                avg_final_coverage += [float(info[i]["p_score"]) for i in range(len(info))]
+                end_phases += [str(info[i]["phase"]) for i in range(len(info))]
             completion_id_list += [info[i]["all_completions_ids"] for i in range(len(info))]
             videorecorder.save("eval_{}_{}.mp4".format(epoch, goal_idx))
         return (
@@ -503,6 +613,7 @@ def main(cfg):
             completion_id_list,
             avg_max_coverage,
             avg_final_coverage,
+            end_phases,
         )
 
     # Restore bookkeeping from snapshot when resuming, else start fresh.
@@ -537,6 +648,32 @@ def main(cfg):
     # x-axis of every logged series: optimizer steps done so far. One step per
     # batch, so a resumed run at start_epoch continues on the same step values.
     steps_per_epoch = len(train_loader)
+
+    # Optional LR schedule, e.g. warmup then one half-cosine to 0 at the last step.
+    # Set in epochs, stepped per optimizer step. Not passed to accelerator.prepare:
+    # steps_per_epoch already counts this process's batches, and the prepared
+    # scheduler would step once per process.
+    lr_scheduler = None
+    lr_scheduler_cfg = cfg.get("lr_scheduler", None)
+    if lr_scheduler_cfg is not None:
+        lr_scheduler = get_scheduler(
+            lr_scheduler_cfg.name,
+            optimizer,
+            num_warmup_steps=lr_scheduler_cfg.get("warmup_epochs", 0) * steps_per_epoch,
+            num_training_steps=cfg.epochs * steps_per_epoch,
+        )
+        if resume_lr_scheduler_state is not None:
+            lr_scheduler.load_state_dict(resume_lr_scheduler_state)
+            # load_state_dict leaves the optimizer at the LR of step 0 (0 during warmup)
+            for group, lr in zip(optimizer.param_groups, lr_scheduler.get_last_lr()):
+                group["lr"] = lr
+        elif start_epoch > 0:
+            # snapshot from a run without a schedule: replay the steps already done
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)  # step before optimizer.step
+                for _ in range(start_epoch * steps_per_epoch):
+                    lr_scheduler.step()
+
     metrics_logger = MetricsLogger(
         save_path / "tensorboard",
         accelerator.is_main_process,
@@ -572,7 +709,7 @@ def main(cfg):
         if (epoch + 1) % cfg.eval_on_env_freq == 0:
             set_inference_steps(cfg.get("rollout_inference_steps", 100))
             rollout_start = time.perf_counter()
-            avg_reward, completion_id_list, max_coverage, final_coverage = eval_on_env(
+            avg_reward, completion_id_list, max_coverage, final_coverage, end_phases = eval_on_env(
                 cfg,
                 videorecorder=video,
                 epoch=epoch,
@@ -587,20 +724,8 @@ def main(cfg):
             metrics_logger.log_scalars(
                 {"rollout/avg_reward": avg_reward}, step=epoch_start_step, epoch=epoch
             )
-            metrics = None
-            if cfg.env.gym.id in ["pusht", "blockpush", "cube"]:
-                metric_final = (
-                    "final coverage" if cfg.env.gym.id == "pusht" else "entered"
-                )
-                metric_max = "max coverage" if cfg.env.gym.id == "pusht" else "moved"
-                metrics = {
-                    f"{metric_final} mean": sum(final_coverage) / len(final_coverage),
-                    f"{metric_final} max": max(final_coverage),
-                    f"{metric_final} min": min(final_coverage),
-                    f"{metric_max} mean": sum(max_coverage) / len(max_coverage),
-                    f"{metric_max} max": max(max_coverage),
-                    f"{metric_max} min": min(max_coverage),
-                }
+            metrics = rollout_metrics(cfg.env.gym.id, max_coverage, final_coverage, end_phases)
+            if metrics is not None:
                 print("final coverage mean: ", sum(final_coverage) / len(final_coverage))
                 metrics_logger.log_scalars(
                     rollout_scalars(metrics), step=epoch_start_step, epoch=epoch
@@ -613,6 +738,8 @@ def main(cfg):
                 current_eval_metric = metrics["final coverage mean"]
             elif cfg.env.gym.id in ["blockpush", "cube"]:
                 current_eval_metric = metrics["entered mean"]
+            elif is_wedge:
+                current_eval_metric = metrics["p_score mean"]
             else:  # libero_goal
                 current_eval_metric = avg_reward
             if current_eval_metric > best_eval_metric:
@@ -724,7 +851,10 @@ def main(cfg):
             with nvtx_range("backward"):
                 accelerator.backward(loss)
             with nvtx_range("optimizer"):
+                step_lr = optimizer.param_groups[0]["lr"]  # LR of this update
                 optimizer.step()
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
 
             if use_diffusion:
                 with nvtx_range("ema"):
@@ -744,7 +874,8 @@ def main(cfg):
                 time_sums[x] += y
             with nvtx_range("log"):
                 metrics_logger.log_scalars(
-                    {**{"train/{}".format(x): y for x, y in loss_dict.items()}, **step_times},
+                    {**{"train/{}".format(x): y for x, y in loss_dict.items()}, **step_times,
+                     "train/lr": step_lr},
                     step=epoch_start_step + i + 1,
                     epoch=epoch,
                 )
@@ -784,7 +915,7 @@ def main(cfg):
             snapshot_start = time.perf_counter()
             save_snapshot(save_path, cbet_model, optimizer, accelerator, epoch,
                           wandb_run_id, metrics_history, reward_history,
-                          best_eval_metric)
+                          best_eval_metric, lr_scheduler)
             metrics_logger.log_scalars(
                 {"time/snapshot_s": time.perf_counter() - snapshot_start},
                 step=epoch_end_step, epoch=epoch,
@@ -792,7 +923,7 @@ def main(cfg):
 
     set_inference_steps(cfg.get("final_inference_steps", 100))
     final_eval_start = time.perf_counter()
-    avg_reward, completion_id_list, max_coverage, final_coverage = eval_on_env(
+    avg_reward, completion_id_list, max_coverage, final_coverage, end_phases = eval_on_env(
         cfg,
         num_evals=cfg.num_final_evals,
         videorecorder=video,
@@ -817,17 +948,8 @@ def main(cfg):
     metrics_logger.log_scalars(
         {"rollout/avg_reward": avg_reward}, step=cfg.epochs * steps_per_epoch, epoch=cfg.epochs
     )
-    if cfg.env.gym.id in ["pusht", "blockpush", "cube"]:
-        metric_final = "final coverage" if cfg.env.gym.id == "pusht" else "entered"
-        metric_max = "max coverage" if cfg.env.gym.id == "pusht" else "moved"
-        metrics = {
-            f"{metric_final} mean": sum(final_coverage) / len(final_coverage),
-            f"{metric_final} max": max(final_coverage),
-            f"{metric_final} min": min(final_coverage),
-            f"{metric_max} mean": sum(max_coverage) / len(max_coverage),
-            f"{metric_max} max": max(max_coverage),
-            f"{metric_max} min": min(max_coverage),
-        }
+    metrics = rollout_metrics(cfg.env.gym.id, max_coverage, final_coverage, end_phases)
+    if metrics is not None:
         metrics_logger.log_scalars(
             rollout_scalars(metrics), step=cfg.epochs * steps_per_epoch, epoch=cfg.epochs
         )
@@ -839,6 +961,8 @@ def main(cfg):
         final_eval_on_env = max([x["final coverage mean"] for x in metrics_history])
     elif cfg.env.gym.id == "blockpush" or cfg.env.gym.id == "cube":
         final_eval_on_env = max([x["entered mean"] for x in metrics_history])
+    elif is_wedge:
+        final_eval_on_env = max([x["p_score mean"] for x in metrics_history])
     else:  # libero_goal and anything else without a coverage-style metric
         final_eval_on_env = max(reward_history)
     metrics_logger.log_scalars(
