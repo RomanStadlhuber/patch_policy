@@ -3,6 +3,7 @@ import einops
 import os
 import random
 import time
+import warnings
 from collections import defaultdict, deque
 from functools import partial
 from pathlib import Path
@@ -12,6 +13,7 @@ import hydra
 import numpy as np
 import torch
 import tqdm
+from diffusers.optimization import get_scheduler
 from omegaconf import OmegaConf
 
 import wandb
@@ -66,12 +68,14 @@ def nvtx_iter(iterable, name, nvtx_range):
 
 
 def save_snapshot(save_path, cbet_model, optimizer, accelerator, epoch,
-                  wandb_run_id, metrics_history, reward_history, best_eval_metric):
+                  wandb_run_id, metrics_history, reward_history, best_eval_metric,
+                  lr_scheduler=None):
     # Snapshot the full training state so a preempted/requeued job can resume.
     cbet_model_raw = accelerator.unwrap_model(cbet_model)
     snapshot = {
         "model": cbet_model_raw,
         "optimizer_state_dict": optimizer.state_dict(),
+        "lr_scheduler_state_dict": lr_scheduler.state_dict() if lr_scheduler is not None else None,
         "epoch": epoch,
         "wandb_run_id": wandb_run_id,
         "metrics_history": metrics_history,
@@ -308,6 +312,7 @@ def main(cfg):
     resume_metrics_history = None
     resume_reward_history = None
     resume_best_eval_metric = None
+    resume_lr_scheduler_state = None
     if snapshot_path.exists():
         logger.info(f"Resuming from snapshot: {snapshot_path}")
         snapshot = load_snapshot(snapshot_path, cbet_model, optimizer, accelerator)
@@ -315,6 +320,7 @@ def main(cfg):
         resume_metrics_history = snapshot["metrics_history"]
         resume_reward_history = snapshot["reward_history"]
         resume_best_eval_metric = snapshot.get("best_eval_metric", float("-inf"))
+        resume_lr_scheduler_state = snapshot.get("lr_scheduler_state_dict")
         logger.info(f"Resumed from epoch {snapshot['epoch']}, will start at epoch {start_epoch}")
 
     # No need to create directory or wait - Hydra already set up the working directory
@@ -640,6 +646,32 @@ def main(cfg):
     # x-axis of every logged series: optimizer steps done so far. One step per
     # batch, so a resumed run at start_epoch continues on the same step values.
     steps_per_epoch = len(train_loader)
+
+    # Optional LR schedule, e.g. warmup then one half-cosine to 0 at the last step.
+    # Set in epochs, stepped per optimizer step. Not passed to accelerator.prepare:
+    # steps_per_epoch already counts this process's batches, and the prepared
+    # scheduler would step once per process.
+    lr_scheduler = None
+    lr_scheduler_cfg = cfg.get("lr_scheduler", None)
+    if lr_scheduler_cfg is not None:
+        lr_scheduler = get_scheduler(
+            lr_scheduler_cfg.name,
+            optimizer,
+            num_warmup_steps=lr_scheduler_cfg.get("warmup_epochs", 0) * steps_per_epoch,
+            num_training_steps=cfg.epochs * steps_per_epoch,
+        )
+        if resume_lr_scheduler_state is not None:
+            lr_scheduler.load_state_dict(resume_lr_scheduler_state)
+            # load_state_dict leaves the optimizer at the LR of step 0 (0 during warmup)
+            for group, lr in zip(optimizer.param_groups, lr_scheduler.get_last_lr()):
+                group["lr"] = lr
+        elif start_epoch > 0:
+            # snapshot from a run without a schedule: replay the steps already done
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)  # step before optimizer.step
+                for _ in range(start_epoch * steps_per_epoch):
+                    lr_scheduler.step()
+
     metrics_logger = MetricsLogger(
         save_path / "tensorboard",
         accelerator.is_main_process,
@@ -817,7 +849,10 @@ def main(cfg):
             with nvtx_range("backward"):
                 accelerator.backward(loss)
             with nvtx_range("optimizer"):
+                step_lr = optimizer.param_groups[0]["lr"]  # LR of this update
                 optimizer.step()
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
 
             if use_diffusion:
                 with nvtx_range("ema"):
@@ -837,7 +872,8 @@ def main(cfg):
                 time_sums[x] += y
             with nvtx_range("log"):
                 metrics_logger.log_scalars(
-                    {**{"train/{}".format(x): y for x, y in loss_dict.items()}, **step_times},
+                    {**{"train/{}".format(x): y for x, y in loss_dict.items()}, **step_times,
+                     "train/lr": step_lr},
                     step=epoch_start_step + i + 1,
                     epoch=epoch,
                 )
@@ -877,7 +913,7 @@ def main(cfg):
             snapshot_start = time.perf_counter()
             save_snapshot(save_path, cbet_model, optimizer, accelerator, epoch,
                           wandb_run_id, metrics_history, reward_history,
-                          best_eval_metric)
+                          best_eval_metric, lr_scheduler)
             metrics_logger.log_scalars(
                 {"time/snapshot_s": time.perf_counter() - snapshot_start},
                 step=epoch_end_step, epoch=epoch,
