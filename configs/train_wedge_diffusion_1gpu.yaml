@@ -1,4 +1,4 @@
-# Wedge diffusion policy, single-GPU embedding-precompute run: 300 epochs, 100 rollouts per env
+# Wedge diffusion policy, single-GPU embedding-precompute run: 300 epochs, 30 rollouts per env
 # eval, as the constant-LR baseline (supermanipulation STATUS.md, "Baseline run").
 defaults:
   - train_wedge_diffusion
@@ -12,8 +12,8 @@ eval_freq: 1
 # env eval every 10 epochs ((epoch + 1) % freq == 0), then the final eval
 eval_on_env_freq: 10
 num_envs: 10
-num_env_evals: 100
-num_final_evals: 100
+num_env_evals: 30
+num_final_evals: 30
 precompute_embeddings: true
 num_workers: 2
 
