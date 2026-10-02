@@ -42,6 +42,8 @@ from resources_test import format_params, count_parameters
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 os.environ["WANDB_START_METHOD"] = "thread"
+# metrics go to TensorBoard; WANDB_MODE=online turns wandb logging back on
+os.environ.setdefault("WANDB_MODE", "disabled")
 logger = logging.getLogger(__name__)
 
 if "MUJOCO_GL" not in os.environ:

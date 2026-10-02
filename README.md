@@ -33,7 +33,7 @@ The wedge grasp env (Drake) needs a `supermanipulation` checkout next to this on
 Run commands through `uv run` (e.g. `uv run python train_policy.py ...`), or activate the
 environment with `source .venv/bin/activate`.
 
-Tested on Ubuntu 22.04 with CUDA 12.8. To log training runs, log in to Weights & Biases with `wandb login` (or set `export WANDB_MODE=disabled` to turn logging off). In `./configs/env_vars/env_vars.yaml`, set `wandb_entity` to your wandb username.
+Tested on Ubuntu 22.04 with CUDA 12.8. Training runs log to TensorBoard in each run directory; Weights & Biases logging is off by default. To turn it on, log in with `wandb login`, set `wandb_entity` to your wandb username in `./configs/env_vars/env_vars.yaml`, and run with `WANDB_MODE=online`.
 
 ## Datasets
 
