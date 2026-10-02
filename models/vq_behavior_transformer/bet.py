@@ -206,6 +206,7 @@ class BehaviorTransformer(nn.Module):
         super().train(mode)
         if self.vqvae_is_fit:
             self._vqvae_model.eval()
+        return self
 
     def forward(
         self,

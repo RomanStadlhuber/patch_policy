@@ -932,5 +932,3 @@ class DiffusionPolicy(nn.Module):
     def set_normalizer(self, normalizer: LinearNormalizer) -> None:
         self.normalizer = normalizer
 
-    def train(self, mode: bool = True):
-        super().train(mode)
