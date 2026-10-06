@@ -32,7 +32,7 @@ num_envs: 10
 num_final_evals: 30
 
 # denoising steps when sampling actions with DDIM; training always uses num_train_timesteps.
-rollout_inference_steps: 100  # rollouts during training
+rollout_inference_steps: 10  # rollouts during training; the 2026-10-06 sweep found no loss against 100
 final_inference_steps: 100  # final eval after training
 ddim_eta: 0.0  # 0.0 samples deterministically, 1.0 adds as much noise per step as DDPM
 # pred_horizon 16 (t-1 .. t+14) must match the export's chunk length
