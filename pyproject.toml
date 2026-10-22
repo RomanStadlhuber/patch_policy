@@ -85,7 +85,7 @@ constraint-dependencies = [
     "av==12.0.0",
     "bddl==1.0.1",
     "beautifulsoup4==4.13.3",
-    "certifi==2024.6.2",
+    "certifi==2026.10.19",
     "cffi==1.16.0",
     "charset-normalizer==3.3.2",
     "click==8.1.7",
